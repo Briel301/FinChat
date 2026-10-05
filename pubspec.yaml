@@ -1,0 +1,47 @@
+name: finchat
+description: "Aplicación de mensajería instantánea multiplataforma con Supabase, MFA, chat multimedia en tiempo real y soporte offline."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # --- BaaS & Backend (Supabase) ---
+  supabase_flutter: ^2.5.0
+
+  # --- Gestión de Estado & Arquitectura ---
+  provider: ^6.1.2
+
+  # --- Persistencia Local & Caché Offline (Should Have: 7 pts) ---
+  shared_preferences: ^2.2.3
+
+  # --- Multimedia & Hardware (Must Have: Fotos, Videos, Audio 1 min) ---
+  image_picker: ^1.1.2
+  flutter_image_compress: ^2.3.0
+  record: ^5.1.2
+  audioplayers: ^6.0.0
+
+  # --- Notificaciones Push (Should Have: 8 pts) ---
+  flutter_local_notifications: ^17.2.1
+
+  # --- Utilidades & Conectividad ---
+  intl: ^0.19.0
+  uuid: ^4.4.0
+  connectivity_plus: ^6.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - recursos/logo/
+    - recursos/iconos/
