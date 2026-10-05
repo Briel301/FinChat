@@ -19,7 +19,6 @@ class _MediaRecorderViewState extends State<MediaRecorderView> {
   final _chatService = ChatService();
   String? _lastRecordedInfo;
   int? _lastDuration;
-  int? _savedBytes;
 
   @override
   Widget build(BuildContext context) {
@@ -144,7 +143,6 @@ class _MediaRecorderViewState extends State<MediaRecorderView> {
                             final attachment = await _mediaService.stopVoiceRecording();
                             setState(() {
                               _lastDuration = attachment.durationSeconds;
-                              _savedBytes = attachment.originalSizeBytes - attachment.compressedSizeBytes;
                               _lastRecordedInfo = 
                                   'Nota de ${_lastDuration}s procesada. Peso original: ${OptimizationUtils.formatBytes(attachment.originalSizeBytes)} -> Optimizado: ${OptimizationUtils.formatBytes(attachment.compressedSizeBytes)} (${attachment.savingsPercent.toStringAsFixed(1)}% de ahorro).';
                             });

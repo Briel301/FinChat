@@ -120,7 +120,7 @@ class _AuthInteractiveViewState extends State<AuthInteractiveView> {
                     decoration: BoxDecoration(
                       color: Colors.green.shade50,
                       borderRadius: BorderRadius.circular(16),
-                      border: Border.pad(BorderSide(color: Colors.green.shade300)),
+                      border: Border.all(color: Colors.green.shade300),
                     ),
                     child: Column(
                       children: [

@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 /// Servicio centralizado de conectividad para coordinar el modo Offline (Should Have: 7 pts).
