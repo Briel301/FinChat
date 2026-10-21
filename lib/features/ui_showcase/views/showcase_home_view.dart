@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../chat/views/conversations_list_view.dart';
 import 'auth_interactive_view.dart';
 import 'directory_search_view.dart';
-import 'chat_playground_view.dart';
 import 'media_recorder_view.dart';
 import 'offline_sync_view.dart';
 
@@ -108,12 +108,12 @@ class ShowcaseHomeView extends StatelessWidget {
           // 3. Chat 1 a 1 en Tiempo Real
           _buildFeatureCard(
             context: context,
-            title: 'Chat 1 a 1 en Tiempo Real',
+            title: 'Chat 1 a 1 en Tiempo Real (Bandeja & Sala)',
             badgeText: 'Must Have • 10 pts',
             badgeColor: Colors.green,
             icon: Icons.chat,
-            description: 'Envío y recepción de mensajes instantáneos, indicador "escribiendo...", confirmación de lectura con doble check azul e historial.',
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ChatPlaygroundView())),
+            description: 'Bandeja de entrada (Inbox WhatsApp), sala de chat con scroll inverso, burbujas ergonómicas y envío optimista en tiempo real.',
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ConversationsListView())),
           ),
 
           // 4. Multimedia y Notas de Voz (1 min)
@@ -206,7 +206,7 @@ class ShowcaseHomeView extends StatelessWidget {
               Row(
                 children: [
                   CircleAvatar(
-                    backgroundColor: badgeColor.withOpacity(0.12),
+                    backgroundColor: badgeColor.withAlpha(30),
                     radius: 20,
                     child: Icon(icon, color: badgeColor, size: 22),
                   ),
@@ -220,7 +220,7 @@ class ShowcaseHomeView extends StatelessWidget {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(
-                      color: badgeColor.withOpacity(0.12),
+                      color: badgeColor.withAlpha(30),
                       borderRadius: BorderRadius.circular(6),
                     ),
                     child: Text(

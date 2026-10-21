@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
-import '../../users/models/user_profile.dart';
-import '../../users/services/user_service.dart';
-import '../../../core/theme/app_theme.dart';
-import 'chat_playground_view.dart';
+import 'package:provider/provider.dart';
 
-/// Vista interactiva para probar la búsqueda de usuarios mediante coincidencia exacta de "Nombre de Usuario".
+import '../../users/providers/user_provider.dart';
+import '../../../core/theme/app_theme.dart';
+import '../../chat/views/chat_room_view.dart';
+
+/// Vista interactiva para probar la búsqueda de usuarios mediante coincidencia exacta
+/// de "Nombre de Usuario" utilizando [UserProvider].
 class DirectorySearchView extends StatefulWidget {
   const DirectorySearchView({super.key});
 
@@ -13,12 +15,7 @@ class DirectorySearchView extends StatefulWidget {
 }
 
 class _DirectorySearchViewState extends State<DirectorySearchView> {
-  final _userService = UserService();
   final _searchController = TextEditingController();
-
-  UserProfile? _matchedUser;
-  bool _hasSearched = false;
-  bool _isSearching = false;
 
   @override
   void dispose() {
@@ -26,28 +23,21 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
     super.dispose();
   }
 
-  Future<void> _performExactSearch() async {
-    setState(() {
-      _isSearching = true;
-      _hasSearched = true;
-      _matchedUser = null;
-    });
-
-    final result = await _userService.searchByExactUsername(_searchController.text);
-
-    setState(() {
-      _isSearching = false;
-      _matchedUser = result;
-    });
+  void _onSearch(UserProvider userProvider) {
+    userProvider.searchUser(_searchController.text);
   }
 
   @override
   Widget build(BuildContext context) {
-    final demoUsers = _userService.getAllUsersForDemo();
+    final userProvider = context.watch<UserProvider>();
+    final isSearching = userProvider.isSearching;
+    final hasSearched = userProvider.hasSearched;
+    final matchedUser = userProvider.searchResult;
+    final demoUsers = userProvider.demoUsers;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Búsqueda Exacta de Usuario'),
+        title: const Text('Directorio & Búsqueda Exacta (Fase 2)'),
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
@@ -66,7 +56,7 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        'Must Have (10 pts): Búsqueda de usuarios mediante coincidencia EXACTA de "Nombre de Usuario" (índice B-Tree en Supabase).',
+                        'Must Have (10 pts): Búsqueda de usuarios mediante coincidencia EXACTA de "Nombre de Usuario" (índice B-Tree en Supabase, sin comodines %).',
                         style: TextStyle(fontSize: 13, color: Colors.amber.shade900),
                       ),
                     ),
@@ -78,7 +68,7 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
 
             // Chips con nombres de prueba para testear rápido
             const Text(
-              'Usuarios registrados de prueba (toca uno para probar):',
+              'Usuarios de prueba en Supabase (toca uno para probar):',
               style: TextStyle(fontWeight: FontWeight.w600, color: AppTheme.textMuted),
             ),
             const SizedBox(height: 8),
@@ -90,21 +80,21 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
                   label: Text(user.username),
                   onPressed: () {
                     _searchController.text = user.username;
-                    _performExactSearch();
+                    _onSearch(userProvider);
                   },
                 );
               }).toList(),
             ),
             const SizedBox(height: 16),
 
-            // Campo de búsqueda
+            // Campo de búsqueda con botón de lupa
             Row(
               children: [
                 Expanded(
                   child: TextField(
                     controller: _searchController,
                     decoration: InputDecoration(
-                      labelText: 'Nombre de usuario exacto',
+                      labelText: 'Nombre de usuario exacto (@usuario)',
                       hintText: 'ej. usuario1',
                       prefixIcon: const Icon(Icons.search),
                       suffixIcon: _searchController.text.isNotEmpty
@@ -112,58 +102,69 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
                               icon: const Icon(Icons.clear),
                               onPressed: () {
                                 _searchController.clear();
-                                setState(() {
-                                  _hasSearched = false;
-                                  _matchedUser = null;
-                                });
+                                userProvider.clearSearch();
                               },
                             )
                           : null,
                     ),
-                    onSubmitted: (_) => _performExactSearch(),
+                    onSubmitted: (_) => _onSearch(userProvider),
                   ),
                 ),
                 const SizedBox(width: 10),
-                ElevatedButton(
+                ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(
-                    minimumSize: const Size(60, 50),
+                    minimumSize: const Size(100, 52),
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                   ),
-                  onPressed: _isSearching ? null : _performExactSearch,
-                  child: _isSearching
+                  onPressed: isSearching ? null : () => _onSearch(userProvider),
+                  icon: isSearching
                       ? const SizedBox(
-                          width: 20,
-                          height: 20,
+                          width: 18,
+                          height: 18,
                           child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
                         )
-                      : const Text('Buscar'),
+                      : const Icon(Icons.search),
+                  label: const Text('Buscar'),
                 ),
               ],
             ),
             const SizedBox(height: 24),
 
             // Resultado de la búsqueda exacta
-            if (_hasSearched) ...[
-              if (_matchedUser != null) ...[
+            if (hasSearched) ...[
+              if (matchedUser != null) ...[
                 const Text(
                   'Resultado Encontrado (Coincidencia Exacta):',
                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 ),
                 const SizedBox(height: 12),
                 Card(
+                  elevation: 2,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                   child: Padding(
-                    padding: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.all(18),
                     child: Column(
                       children: [
                         Row(
                           children: [
                             CircleAvatar(
-                              radius: 30,
-                              backgroundColor: AppTheme.primaryColor.withOpacity(0.15),
-                              child: Text(
-                                _matchedUser!.username.substring(0, 1).toUpperCase(),
-                                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: AppTheme.primaryColor),
-                              ),
+                              radius: 32,
+                              backgroundColor: AppTheme.primaryColor.withValues(alpha: 0.15),
+                              backgroundImage: matchedUser.avatarUrl != null
+                                  ? NetworkImage(matchedUser.avatarUrl!)
+                                  : null,
+                              child: matchedUser.avatarUrl == null
+                                  ? Text(
+                                      matchedUser.username.isNotEmpty
+                                          ? matchedUser.username[0].toUpperCase()
+                                          : '?',
+                                      style: const TextStyle(
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.bold,
+                                        color: AppTheme.primaryColor,
+                                      ),
+                                    )
+                                  : null,
                             ),
                             const SizedBox(width: 16),
                             Expanded(
@@ -171,16 +172,22 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
-                                    _matchedUser!.fullName,
-                                    style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                                    matchedUser.fullName,
+                                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                                   ),
                                   Text(
-                                    '@${_matchedUser!.username}',
-                                    style: const TextStyle(color: AppTheme.primaryColor, fontWeight: FontWeight.w600),
+                                    '@${matchedUser.username}',
+                                    style: const TextStyle(
+                                      color: AppTheme.primaryColor,
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 14,
+                                    ),
                                   ),
-                                  const SizedBox(height: 4),
+                                  const SizedBox(height: 6),
                                   Text(
-                                    _matchedUser!.bio ?? 'Sin biografía',
+                                    matchedUser.bio != null && matchedUser.bio!.isNotEmpty
+                                        ? matchedUser.bio!
+                                        : 'Sin biografía disponible',
                                     style: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
                                   ),
                                 ],
@@ -188,18 +195,24 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
                             ),
                           ],
                         ),
-                        const Divider(height: 24),
+                        const Divider(height: 28),
                         ElevatedButton.icon(
                           onPressed: () {
                             Navigator.push(
                               context,
                               MaterialPageRoute(
-                                builder: (_) => const ChatPlaygroundView(),
+                                builder: (_) => ChatRoomView(
+                                  chatId: 'chat_${matchedUser.id}',
+                                  otherUserId: matchedUser.id,
+                                  otherUsername: matchedUser.username,
+                                  otherFullName: matchedUser.fullName,
+                                  otherAvatarUrl: matchedUser.avatarUrl,
+                                ),
                               ),
                             );
                           },
                           icon: const Icon(Icons.chat_bubble_outline),
-                          label: Text('Iniciar Conversación con @${_matchedUser!.username}'),
+                          label: Text('Iniciar Conversación con @${matchedUser.username}'),
                         ),
                       ],
                     ),
@@ -207,25 +220,25 @@ class _DirectorySearchViewState extends State<DirectorySearchView> {
                 ),
               ] else ...[
                 Container(
-                  padding: const EdgeInsets.all(20),
+                  padding: const EdgeInsets.all(22),
                   decoration: BoxDecoration(
                     color: Colors.grey.shade100,
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(16),
                     border: Border.all(color: Colors.grey.shade300),
                   ),
                   child: Column(
                     children: [
                       const Icon(Icons.person_off_outlined, size: 48, color: Colors.grey),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 10),
                       const Text(
                         'No se encontró ningún usuario',
                         style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                       ),
-                      const SizedBox(height: 4),
+                      const SizedBox(height: 6),
                       Text(
-                        'Recuerda que la búsqueda requiere el nombre exacto (ej. "usuario1" y no "usuario").',
+                        'La búsqueda en FinChat requiere el nombre de usuario exacto (ej. "usuario1" y no "usuario"). No se utilizan comodines %.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+                        style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
                       ),
                     ],
                   ),

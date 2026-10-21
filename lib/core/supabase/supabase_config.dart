@@ -28,6 +28,7 @@ abstract final class SupabaseConfig {
   static const String bucketChatImages = 'chat_images';
   static const String bucketChatAudios = 'chat_audios';
   static const String bucketChatVideos = 'chat_videos';
+  static const String bucketChatMedia = 'chat_media';
 
   static bool _isInitialized = false;
 

@@ -148,7 +148,7 @@ class _MediaRecorderViewState extends State<MediaRecorderView> {
                             });
 
                             // Envía directamente al chat
-                            await _chatService.sendMessage(
+                            await _chatService.sendMediaMessage(
                               text: '🎤 Nota de voz (${_lastDuration}s)',
                               type: MessageType.audio,
                               mediaUrl: attachment.remoteStorageUrl,

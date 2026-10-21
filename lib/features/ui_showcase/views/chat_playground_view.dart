@@ -45,13 +45,13 @@ class _ChatPlaygroundViewState extends State<ChatPlaygroundView> {
     final text = _textController.text.trim();
     if (text.isEmpty) return;
     _textController.clear();
-    await _chatService.sendMessage(text: text);
+    await _chatService.sendMediaMessage(text: text);
     _scrollToBottom();
   }
 
   Future<void> _handleSendPhoto() async {
     final photo = await _mediaService.processCameraPhoto();
-    await _chatService.sendMessage(
+    await _chatService.sendMediaMessage(
       text: '📷 Foto optimizada (${OptimizationUtils.formatBytes(photo.compressedSizeBytes)} - WebP)',
       type: MessageType.image,
       mediaUrl: photo.remoteStorageUrl,
@@ -62,7 +62,7 @@ class _ChatPlaygroundViewState extends State<ChatPlaygroundView> {
 
   Future<void> _handleSendVideo() async {
     final video = await _mediaService.processVideo();
-    await _chatService.sendMessage(
+    await _chatService.sendMediaMessage(
       text: '🎥 Video compartido (${video.durationSeconds}s - H.264)',
       type: MessageType.video,
       mediaUrl: video.remoteStorageUrl,

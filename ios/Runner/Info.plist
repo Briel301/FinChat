@@ -2,6 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Permisos de Privacidad Multimedia (Cámara, Micrófono y Galería) -->
+	<key>NSCameraUsageDescription</key>
+	<string>FinChat necesita acceso a la cámara para tomar fotos y grabar videos directamente en las conversaciones.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>FinChat requiere acceso al micrófono para grabar y enviar notas de voz de hasta 1 minuto en el chat.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>FinChat necesita acceso a tu galería para seleccionar y enviar imágenes y videos en tus chats.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>FinChat necesita permiso para guardar imágenes y videos descargados en tu galería.</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>

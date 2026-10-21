@@ -21,6 +21,7 @@ void main() {
       expect(SupabaseConfig.bucketChatImages, 'chat_images');
       expect(SupabaseConfig.bucketChatAudios, 'chat_audios');
       expect(SupabaseConfig.bucketChatVideos, 'chat_videos');
+      expect(SupabaseConfig.bucketChatMedia, 'chat_media');
     });
 
     test('getters throw StateError when not initialized', () {
