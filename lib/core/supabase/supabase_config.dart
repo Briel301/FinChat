@@ -6,16 +6,10 @@ abstract final class SupabaseConfig {
   SupabaseConfig._();
 
   // URL del proyecto Supabase
-  static const String supabaseUrl = String.fromEnvironment(
-    'SUPABASE_URL',
-    defaultValue: 'https://tu-proyecto.supabase.co',
-  );
+  static const String supabaseUrl = 'https://vrifdodploingeqzlcqo.supabase.co';
 
   // Clave pública anónima de Supabase con RLS
-  static const String supabaseAnonKey = String.fromEnvironment(
-    'SUPABASE_ANON_KEY',
-    defaultValue: 'tu-anon-key-publica',
-  );
+  static const String supabaseAnonKey = 'sb_publishable_KvXfYG-7wrFzcM2LkJ3-6Q_3UG51GV_';
 
   // Tablas en PostgreSQL
   static const String tableProfiles = 'profiles';
