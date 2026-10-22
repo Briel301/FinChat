@@ -3,12 +3,21 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '../../../core/supabase/supabase_config.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../ui_showcase/views/showcase_home_view.dart';
+import '../services/direct_chat_repository.dart';
 
+/// Pantalla de conversación privada 1:1 en tiempo real con un usuario específico.
 class RealChatScreen extends StatefulWidget {
-  const RealChatScreen({super.key});
+  final String currentUserName;
+  final String recipientName;
+
+  const RealChatScreen({
+    super.key,
+    required this.currentUserName,
+    required this.recipientName,
+  });
 
   @override
   State<RealChatScreen> createState() => _RealChatScreenState();
@@ -22,14 +31,14 @@ class _RealChatScreenState extends State<RealChatScreen> {
   RealtimeChannel? _realtimeChannel;
   Timer? _syncTimer;
 
-  String _currentUserName = '';
-  bool _isLoadingUser = true;
+  late String _currentUserName;
   bool _isLoadingMessages = true;
   bool _isSending = false;
 
   @override
   void initState() {
     super.initState();
+    _currentUserName = widget.currentUserName;
     _initChat();
   }
 
@@ -41,8 +50,10 @@ class _RealChatScreenState extends State<RealChatScreen> {
   }
 
   void _initChat() {
-    _loadUserName();
-    _fetchMessages(isInitial: _messages.isEmpty);
+    if (_currentUserName.isEmpty) {
+      _loadUserName();
+    }
+    _fetchMessages();
     _subscribeToRealtime();
     _startBackgroundSync();
   }
@@ -56,23 +67,34 @@ class _RealChatScreenState extends State<RealChatScreen> {
     super.dispose();
   }
 
+  Future<void> _loadUserName() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedName = prefs.getString('chat_username');
+    if (savedName != null && savedName.trim().isNotEmpty && mounted) {
+      setState(() {
+        _currentUserName = savedName.trim();
+      });
+      _fetchMessages();
+    }
+  }
+
   void _startBackgroundSync() {
     _syncTimer?.cancel();
     _syncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      _fetchMessages(isInitial: false);
+      _fetchMessages();
     });
   }
 
-  Future<void> _fetchMessages({bool isInitial = false}) async {
+  Future<void> _fetchMessages() async {
+    if (_currentUserName.isEmpty) return;
+
     try {
-      final data = await SupabaseConfig.client
-          .from('messages')
-          .select()
-          .order('id', ascending: true);
+      final fetchedList = await DirectChatRepository.instance.fetchDirectMessages(
+        currentUser: _currentUserName,
+        otherUser: widget.recipientName,
+      );
 
       if (!mounted) return;
-
-      final fetchedList = List<Map<String, dynamic>>.from(data);
 
       // Comprobar si hay cambios reales para no reconstruir ni mover el scroll innecesariamente
       bool hasChanges = fetchedList.length != _messages.length;
@@ -90,7 +112,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
         }
       }
     } catch (e) {
-      debugPrint('[RealChatScreen] Error al sincronizar mensajes: $e');
+      debugPrint('[RealChatScreen] Error al sincronizar mensajes 1:1: $e');
       if (mounted && _isLoadingMessages) {
         setState(() {
           _isLoadingMessages = false;
@@ -101,18 +123,26 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   void _subscribeToRealtime() {
     _realtimeChannel?.unsubscribe();
-    final channelName = 'messages_live_${DateTime.now().millisecondsSinceEpoch}';
+    final channelName = 'dm_live_${DateTime.now().millisecondsSinceEpoch}';
     _realtimeChannel = SupabaseConfig.client
         .channel(channelName)
         .onPostgresChanges(
           event: PostgresChangeEvent.all,
           schema: 'public',
-          table: 'messages',
+          table: SupabaseConfig.tableMessages,
           callback: (payload) {
             if (payload.eventType == PostgresChangeEvent.insert) {
-              final newRecord = payload.newRecord;
-              if (newRecord.isNotEmpty) {
-                _addOrUpdateMessage(newRecord);
+              final raw = payload.newRecord;
+              if (raw.isNotEmpty) {
+                final normalized = DirectChatRepository.instance.normalizeMessage(raw);
+                if (normalized != null &&
+                    DirectChatRepository.instance.isMessageBetween(
+                      normalized,
+                      _currentUserName,
+                      widget.recipientName,
+                    )) {
+                  _addOrUpdateMessage(normalized);
+                }
               }
             }
           },
@@ -128,100 +158,10 @@ class _RealChatScreenState extends State<RealChatScreen> {
     if (index == -1) {
       setState(() {
         _messages.add(msg);
-        // Asegurar orden por id
         _messages.sort((a, b) => (a['id'] as int).compareTo(b['id'] as int));
       });
       _scrollToBottom();
     }
-  }
-
-  Future<void> _loadUserName() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedName = prefs.getString('chat_username');
-
-    if (savedName != null && savedName.trim().isNotEmpty) {
-      if (mounted) {
-        setState(() {
-          _currentUserName = savedName.trim();
-          _isLoadingUser = false;
-        });
-      }
-    } else {
-      if (mounted) {
-        setState(() {
-          _isLoadingUser = false;
-        });
-      }
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_currentUserName.isEmpty && mounted) {
-          _promptForUserName(canCancel: false);
-        }
-      });
-    }
-  }
-
-  Future<void> _promptForUserName({bool canCancel = true}) async {
-    final controller = TextEditingController(text: _currentUserName);
-    final formKey = GlobalKey<FormState>();
-
-    await showDialog(
-      context: context,
-      barrierDismissible: canCancel,
-      builder: (ctx) {
-        return PopScope(
-          canPop: canCancel,
-          child: AlertDialog(
-            title: const Row(
-              children: [
-                Icon(Icons.person, color: AppTheme.primaryColor),
-                SizedBox(width: 8),
-                Text('¿Cómo te llamas?'),
-              ],
-            ),
-            content: Form(
-              key: formKey,
-              child: TextFormField(
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  hintText: 'Ej. Juan, María, Dispositivo 1...',
-                  labelText: 'Tu apodo o nombre',
-                ),
-                validator: (val) {
-                  if (val == null || val.trim().isEmpty) {
-                    return 'Por favor ingresa un nombre';
-                  }
-                  return null;
-                },
-              ),
-            ),
-            actions: [
-              if (canCancel)
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('Cancelar'),
-                ),
-              ElevatedButton(
-                onPressed: () async {
-                  if (formKey.currentState?.validate() ?? false) {
-                    final newName = controller.text.trim();
-                    final prefs = await SharedPreferences.getInstance();
-                    await prefs.setString('chat_username', newName);
-                    if (mounted) {
-                      setState(() {
-                        _currentUserName = newName;
-                      });
-                    }
-                    if (ctx.mounted) Navigator.of(ctx).pop();
-                  }
-                },
-                child: const Text('Guardar'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
   }
 
   void _scrollToBottom() {
@@ -240,12 +180,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   Future<void> _sendMessage() async {
     final text = _textController.text.trim();
-    if (text.isEmpty || _isSending) return;
-
-    if (_currentUserName.isEmpty) {
-      await _promptForUserName(canCancel: false);
-      if (_currentUserName.isEmpty) return;
-    }
+    if (text.isEmpty || _isSending || _currentUserName.isEmpty) return;
 
     setState(() {
       _isSending = true;
@@ -254,14 +189,15 @@ class _RealChatScreenState extends State<RealChatScreen> {
     _textController.clear();
 
     try {
-      final inserted = await SupabaseConfig.client.from('messages').insert({
-        'sender_name': _currentUserName,
-        'content': text,
-      }).select().single();
+      final inserted = await DirectChatRepository.instance.sendDirectMessage(
+        sender: _currentUserName,
+        receiver: widget.recipientName,
+        content: text,
+      );
 
       _addOrUpdateMessage(inserted);
     } catch (e) {
-      debugPrint('[RealChatScreen] Error al enviar mensaje: $e');
+      debugPrint('[RealChatScreen] Error al enviar mensaje 1:1: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -291,72 +227,56 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoadingUser) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
-    }
+    final recipientInitial = widget.recipientName.isNotEmpty
+        ? widget.recipientName[0].toUpperCase()
+        : '?';
 
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        titleSpacing: 0,
+        title: Row(
           children: [
-            const Text(
-              'FinChat Realtime',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            CircleAvatar(
+              radius: 18,
+              backgroundColor: Colors.white24,
+              child: Text(
+                recipientInitial,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
             ),
-            Row(
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: const BoxDecoration(
-                    color: Colors.greenAccent,
-                    shape: BoxShape.circle,
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.recipientName,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                   ),
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  _currentUserName.isNotEmpty ? 'Tú: $_currentUserName' : 'Sin nombre',
-                  style: const TextStyle(fontSize: 12, color: Colors.white70),
-                ),
-              ],
+                  const Row(
+                    children: [
+                      Icon(Icons.lock_outline, size: 11, color: Colors.greenAccent),
+                      SizedBox(width: 4),
+                      Text(
+                        'Chat 1:1 en tiempo real',
+                        style: TextStyle(fontSize: 11, color: Colors.white70),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ],
         ),
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            tooltip: 'Recargar mensajes',
-            onPressed: () => _fetchMessages(isInitial: false),
-          ),
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            tooltip: 'Cambiar nombre',
-            onPressed: () => _promptForUserName(canCancel: true),
-          ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert),
-            onSelected: (value) {
-              if (value == 'showcase') {
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const ShowcaseHomeView()),
-                );
-              }
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(
-                value: 'showcase',
-                child: Row(
-                  children: [
-                    Icon(Icons.dashboard_outlined, size: 20, color: Colors.blueGrey),
-                    SizedBox(width: 8),
-                    Text('Panel de Requerimientos'),
-                  ],
-                ),
-              ),
-            ],
+            tooltip: 'Sincronizar mensajes',
+            onPressed: _fetchMessages,
           ),
         ],
       ),
@@ -366,28 +286,40 @@ class _RealChatScreenState extends State<RealChatScreen> {
             child: _isLoadingMessages
                 ? const Center(child: CircularProgressIndicator())
                 : RefreshIndicator(
-                    onRefresh: () => _fetchMessages(isInitial: false),
+                    onRefresh: _fetchMessages,
                     child: _messages.isEmpty
                         ? ListView(
                             physics: const AlwaysScrollableScrollPhysics(),
                             children: [
-                              SizedBox(height: MediaQuery.of(context).size.height * 0.3),
+                              SizedBox(height: MediaQuery.of(context).size.height * 0.28),
                               Center(
-                                child: Column(
-                                  children: [
-                                    Icon(Icons.chat_bubble_outline,
-                                        size: 64, color: Colors.grey.shade400),
-                                    const SizedBox(height: 12),
-                                    const Text(
-                                      'No hay mensajes aún',
-                                      style: TextStyle(fontSize: 16, color: Colors.grey),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    const Text(
-                                      '¡Envía un mensaje para comenzar la conversación!',
-                                      style: TextStyle(fontSize: 13, color: Colors.grey),
-                                    ),
-                                  ],
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                                  child: Column(
+                                    children: [
+                                      Icon(
+                                        Icons.mark_chat_unread_outlined,
+                                        size: 64,
+                                        color: Colors.grey.shade400,
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Text(
+                                        'Conversación 1:1 con ${widget.recipientName}',
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.grey,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      const Text(
+                                        'Envía un mensaje directo para iniciar el chat privado.',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(fontSize: 13, color: Colors.grey),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ],
@@ -440,18 +372,6 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                     crossAxisAlignment:
                                         isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
                                     children: [
-                                      if (!isMe)
-                                        Padding(
-                                          padding: const EdgeInsets.only(bottom: 4),
-                                          child: Text(
-                                            sender,
-                                            style: TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 12,
-                                              color: Colors.indigo.shade300,
-                                            ),
-                                          ),
-                                        ),
                                       Text(
                                         content,
                                         style: TextStyle(
@@ -495,7 +415,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
                       controller: _textController,
                       textCapitalization: TextCapitalization.sentences,
                       decoration: InputDecoration(
-                        hintText: 'Escribe un mensaje...',
+                        hintText: 'Mensaje para ${widget.recipientName}...',
                         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(24),
