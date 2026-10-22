@@ -1,6 +1,6 @@
 # FlutterMSG
 
-Aplicación de mensajería instantánea multiplataforma, inspirada en WhatsApp, que permite la comunicación entre usuarios a través de Internet sin depender de un número telefónico o tarjeta SIM. Utiliza una arquitectura Backend as a Service (BaaS) con Supabase/Firebase.
+Aplicación de mensajería instantánea multiplataforma, inspirada en WhatsApp, que permite la comunicación entre usuarios a través de Internet sin depender de un número telefónico o tarjeta SIM. Utiliza una arquitectura Backend as a Service (BaaS) con Supabase.
 
 ## 📜 Reglas del Repositorio
 
