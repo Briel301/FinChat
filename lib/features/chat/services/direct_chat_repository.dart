@@ -1,8 +1,11 @@
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import '../../../core/supabase/supabase_config.dart';
 
-/// Modelo de resumen de contacto / conversación 1:1.
+/// Modelo de contacto y resumen de conversación 1:1 basado en identidad inmutable (UUID).
 class DirectChatContact {
+  final String userId;
   final String username;
   final String? lastMessage;
   final String? lastTimestamp;
@@ -10,6 +13,7 @@ class DirectChatContact {
   final bool isLastFromMe;
 
   const DirectChatContact({
+    required this.userId,
     required this.username,
     this.lastMessage,
     this.lastTimestamp,
@@ -18,187 +22,257 @@ class DirectChatContact {
   });
 }
 
-/// Repositorio para gestionar usuarios y mensajes 1:1 en tiempo real con Supabase.
-/// Soporta de forma nativa la tabla `profiles` y la columna `receiver_name` en `messages`,
-/// e incluye fallback automático en caso de que aún no se haya ejecutado la migración SQL.
+/// Repositorio para gestionar usuarios con ID único inmutable (`profiles.id`)
+/// y mensajes 1:1 vinculados por `sender_id` y `receiver_id`.
 class DirectChatRepository {
   DirectChatRepository._();
   static final DirectChatRepository instance = DirectChatRepository._();
 
+  static const String _prefUserIdKey = 'chat_user_id';
+  static const String _prefUserNameKey = 'chat_username';
   static const String _presenceMarker = '__SYS_PRESENCE__';
-  static final RegExp _fallbackRecipientRegex = RegExp(r'^@\[([^\]]+)\]:\s*(.*)$', dotAll: true);
+  static final RegExp _legacyRecipientRegex = RegExp(r'^@\[([^\]]+)\]:\s*(.*)$', dotAll: true);
+  static const Uuid _uuid = Uuid();
 
-  bool? _hasProfilesTable;
-  bool? _hasReceiverColumn;
+  /// Obtiene o genera el UUID único e inmutable de este dispositivo/usuario.
+  Future<String> ensureLocalUserId() async {
+    final prefs = await SharedPreferences.getInstance();
+    String? userId = prefs.getString(_prefUserIdKey);
+    if (userId == null || userId.trim().isEmpty || !Uuid.isValidUUID(fromString: userId)) {
+      userId = _uuid.v4();
+      await prefs.setString(_prefUserIdKey, userId);
+    }
+    return userId;
+  }
 
-  /// Normaliza un registro crudo de la tabla `messages` para extraer `sender_name`,
-  /// `receiver_name` y `content` (compatible con columna nativa o prefijo `@[usuario]:`).
+  /// Obtiene el nombre de usuario guardado localmente.
+  Future<String> getLocalUserName() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getString(_prefUserNameKey) ?? '').trim();
+  }
+
+  /// Guarda el nombre de usuario localmente y actualiza su perfil en Supabase manteniendo el mismo UUID.
+  Future<void> registerOrUpdateUser({
+    required String userId,
+    required String username,
+  }) async {
+    final cleanName = username.trim();
+    if (cleanName.isEmpty || userId.isEmpty) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefUserNameKey, cleanName);
+
+    try {
+      await SupabaseConfig.client.from(SupabaseConfig.tableProfiles).upsert(
+        {
+          'id': userId,
+          'username': cleanName,
+          'updated_at': DateTime.now().toUtc().toIso8601String(),
+        },
+        onConflict: 'id',
+      );
+    } catch (e) {
+      debugPrint('[DirectChatRepository] Error al sincronizar perfil en profiles: $e');
+    }
+  }
+
+  /// Normaliza un registro de `messages`. Extrae `sender_id`, `receiver_id`, `sender_name` y `content`.
   Map<String, dynamic>? normalizeMessage(Map<String, dynamic> raw) {
-    final sender = (raw['sender_name'] ?? '').toString().trim();
     final rawContent = (raw['content'] ?? '').toString();
-
-    if (sender.isEmpty) return null;
-
-    // Si es un marcador de presencia del sistema, no es un mensaje visible de chat
     if (rawContent == _presenceMarker) {
       return null;
     }
 
-    String? receiver = raw['receiver_name']?.toString().trim();
+    final senderId = raw['sender_id']?.toString().trim() ?? '';
+    final receiverId = raw['receiver_id']?.toString().trim() ?? '';
+    final senderName = (raw['sender_name'] ?? '').toString().trim();
+
+    String? legacyReceiverName = raw['receiver_name']?.toString().trim();
     String cleanContent = rawContent;
 
-    if (receiver == null || receiver.isEmpty) {
-      final match = _fallbackRecipientRegex.firstMatch(rawContent);
-      if (match != null) {
-        receiver = match.group(1)?.trim();
-        cleanContent = match.group(2) ?? '';
-      }
+    final match = _legacyRecipientRegex.firstMatch(rawContent);
+    if (match != null) {
+      legacyReceiverName = match.group(1)?.trim();
+      cleanContent = match.group(2) ?? '';
     }
+
+    if (senderId.isEmpty && senderName.isEmpty) return null;
 
     return {
       'id': raw['id'],
       'created_at': raw['created_at'],
-      'sender_name': sender,
-      'receiver_name': receiver ?? '',
+      'sender_id': senderId,
+      'receiver_id': receiverId,
+      'sender_name': senderName,
+      'receiver_name': legacyReceiverName ?? '',
       'content': cleanContent,
     };
   }
 
-  /// Verifica si un mensaje normalizado pertenece a la conversación 1:1 entre `userA` y `userB`.
-  bool isMessageBetween(Map<String, dynamic> normalizedMsg, String userA, String userB) {
-    final a = userA.trim().toLowerCase();
-    final b = userB.trim().toLowerCase();
-    final sender = (normalizedMsg['sender_name'] ?? '').toString().trim().toLowerCase();
-    final receiver = (normalizedMsg['receiver_name'] ?? '').toString().trim().toLowerCase();
+  /// Verifica si un mensaje pertenece a la conversación 1:1 entre el usuario actual y el destinatario.
+  /// Prioriza la comparación por UUID (`sender_id` / `receiver_id`), manteniendo soporte de lectura
+  /// para mensajes antiguos previos a la migración si coinciden los nombres.
+  bool isMessageBetween({
+    required Map<String, dynamic> normalizedMsg,
+    required String currentUserId,
+    required String otherUserId,
+    String? currentUserName,
+    String? otherUserName,
+  }) {
+    final msgSenderId = (normalizedMsg['sender_id'] ?? '').toString();
+    final msgReceiverId = (normalizedMsg['receiver_id'] ?? '').toString();
 
-    return (sender == a && receiver == b) || (sender == b && receiver == a);
-  }
+    if (msgSenderId.isNotEmpty &&
+        msgReceiverId.isNotEmpty &&
+        currentUserId.isNotEmpty &&
+        otherUserId.isNotEmpty) {
+      return (msgSenderId == currentUserId && msgReceiverId == otherUserId) ||
+          (msgSenderId == otherUserId && msgReceiverId == currentUserId);
+    }
 
-  /// Registra o actualiza la presencia del usuario actual en Supabase.
-  Future<void> registerOrUpdateUser(String username) async {
-    final cleanName = username.trim();
-    if (cleanName.isEmpty) return;
-
-    // 1. Intentar registrar en la tabla `profiles` si está disponible
-    if (_hasProfilesTable != false) {
-      try {
-        await SupabaseConfig.client.from(SupabaseConfig.tableProfiles).upsert(
-          {'username': cleanName},
-          onConflict: 'username',
-        );
-        _hasProfilesTable = true;
-        return;
-      } catch (e) {
-        debugPrint('[DirectChatRepository] Tabla profiles no disponible o sin upsert, usando fallback: $e');
-        _hasProfilesTable = false;
+    // Fallback sólo para mensajes históricos enviados sin UUID
+    if (msgSenderId.isEmpty &&
+        msgReceiverId.isEmpty &&
+        currentUserName != null &&
+        otherUserName != null) {
+      final a = currentUserName.trim().toLowerCase();
+      final b = otherUserName.trim().toLowerCase();
+      final sName = (normalizedMsg['sender_name'] ?? '').toString().trim().toLowerCase();
+      final rName = (normalizedMsg['receiver_name'] ?? '').toString().trim().toLowerCase();
+      if (a.isNotEmpty && b.isNotEmpty) {
+        return (sName == a && rName == b) || (sName == b && rName == a);
       }
     }
 
-    // 2. Fallback: asegurar que el usuario aparezca en el directorio mediante un registro de presencia
+    return false;
+  }
+
+  /// Busca o resuelve un perfil por su nombre de usuario en `profiles`.
+  Future<Map<String, String>?> findProfileByUsername(String username) async {
+    final clean = username.trim();
+    if (clean.isEmpty) return null;
+
     try {
-      final existing = await SupabaseConfig.client
-          .from(SupabaseConfig.tableMessages)
-          .select('id')
-          .ilike('sender_name', cleanName)
+      final data = await SupabaseConfig.client
+          .from(SupabaseConfig.tableProfiles)
+          .select('id, username')
+          .ilike('username', clean)
           .limit(1);
 
-      if ((existing as List).isEmpty) {
-        await SupabaseConfig.client.from(SupabaseConfig.tableMessages).insert({
-          'sender_name': cleanName,
-          'content': _presenceMarker,
-        });
+      final list = data as List;
+      if (list.isNotEmpty) {
+        final row = list.first;
+        return {
+          'id': row['id'].toString(),
+          'username': row['username'].toString(),
+        };
       }
     } catch (e) {
-      debugPrint('[DirectChatRepository] Error al registrar presencia de usuario: $e');
+      debugPrint('[DirectChatRepository] Error buscando perfil por username: $e');
     }
+    return null;
   }
 
-  /// Obtiene todos los contactos disponibles y su último mensaje 1:1 con `currentUserName`.
-  Future<List<DirectChatContact>> fetchContactsWithLastMessage(String currentUserName) async {
-    final meLower = currentUserName.trim().toLowerCase();
-    final Map<String, String> displayNamesByLower = {};
+  /// Obtiene la lista de usuarios registrados en `profiles` (excluyendo `currentUserId`)
+  /// junto con el último mensaje intercambiado por `userId`.
+  Future<List<DirectChatContact>> fetchContactsWithLastMessage({
+    required String currentUserId,
+    required String currentUserName,
+  }) async {
+    // Mapa de userId -> username actual desde la tabla `profiles`
+    final Map<String, String> profilesById = {};
+    // Mapa auxiliar de username(lower) -> userId para vincular mensajes históricos sin UUID
+    final Map<String, String> userIdByLowerName = {};
 
-    // 1. Consultar usuarios en `profiles` si existe la tabla
-    if (_hasProfilesTable != false) {
-      try {
-        final profilesData = await SupabaseConfig.client
-            .from(SupabaseConfig.tableProfiles)
-            .select('username')
-            .order('username', ascending: true);
-        _hasProfilesTable = true;
+    try {
+      final profilesData = await SupabaseConfig.client
+          .from(SupabaseConfig.tableProfiles)
+          .select('id, username')
+          .order('username', ascending: true);
 
-        for (final row in (profilesData as List)) {
-          final uname = (row['username'] ?? '').toString().trim();
-          if (uname.isNotEmpty && uname.toLowerCase() != meLower) {
-            displayNamesByLower[uname.toLowerCase()] = uname;
+      for (final row in (profilesData as List)) {
+        final id = (row['id'] ?? '').toString().trim();
+        final uname = (row['username'] ?? '').toString().trim();
+        if (id.isNotEmpty && uname.isNotEmpty) {
+          userIdByLowerName[uname.toLowerCase()] = id;
+          if (id != currentUserId) {
+            profilesById[id] = uname;
           }
         }
-      } catch (_) {
-        _hasProfilesTable = false;
       }
+    } catch (e) {
+      debugPrint('[DirectChatRepository] Error al consultar profiles: $e');
     }
 
-    // 2. Consultar mensajes para descubrir usuarios activos y armar el resumen 1:1
-    final messagesData = await SupabaseConfig.client
-        .from(SupabaseConfig.tableMessages)
-        .select()
-        .order('id', ascending: true);
+    // Consultar mensajes para obtener el último mensaje 1:1 con cada usuario
+    final Map<String, Map<String, dynamic>> lastMsgByOtherId = {};
+    try {
+      final messagesData = await SupabaseConfig.client
+          .from(SupabaseConfig.tableMessages)
+          .select()
+          .order('id', ascending: true);
 
-    final Map<String, Map<String, dynamic>> lastMsgByOtherUser = {};
+      for (final raw in (messagesData as List)) {
+        final normalized = normalizeMessage(Map<String, dynamic>.from(raw as Map));
+        if (normalized == null) continue;
 
-    for (final raw in (messagesData as List)) {
-      final map = Map<String, dynamic>.from(raw as Map);
-      final rawSender = (map['sender_name'] ?? '').toString().trim();
+        String sId = (normalized['sender_id'] ?? '').toString();
+        String rId = (normalized['receiver_id'] ?? '').toString();
+        final sName = (normalized['sender_name'] ?? '').toString();
+        final rName = (normalized['receiver_name'] ?? '').toString();
 
-      // Ignorar usuario de prueba automática inicial si no es relevante
-      if (rawSender.isNotEmpty &&
-          rawSender.toLowerCase() != meLower &&
-          rawSender.toLowerCase() != 'sistema test') {
-        displayNamesByLower.putIfAbsent(rawSender.toLowerCase(), () => rawSender);
+        // Si es un mensaje antiguo sin UUID, intentar resolver el UUID por el nombre actual
+        if (sId.isEmpty && sName.isNotEmpty) {
+          sId = userIdByLowerName[sName.toLowerCase()] ?? '';
+        }
+        if (rId.isEmpty && rName.isNotEmpty) {
+          rId = userIdByLowerName[rName.toLowerCase()] ?? '';
+        }
+
+        // Si el mensaje involucra un UUID válido que aún no estaba en profilesById, registrarlo con su último nombre conocido
+        if (sId.isNotEmpty && sId != currentUserId && !profilesById.containsKey(sId)) {
+          profilesById[sId] = sName.isNotEmpty ? sName : 'Usuario';
+        }
+        if (rId.isNotEmpty && rId != currentUserId && !profilesById.containsKey(rId)) {
+          profilesById[rId] = rName.isNotEmpty ? rName : 'Usuario';
+        }
+
+        if (sId == currentUserId && rId.isNotEmpty && rId != currentUserId) {
+          lastMsgByOtherId[rId] = normalized;
+        } else if (rId == currentUserId && sId.isNotEmpty && sId != currentUserId) {
+          lastMsgByOtherId[sId] = normalized;
+        }
       }
-
-      final normalized = normalizeMessage(map);
-      if (normalized == null) continue;
-
-      final sender = (normalized['sender_name'] ?? '').toString().trim();
-      final receiver = (normalized['receiver_name'] ?? '').toString().trim();
-
-      if (receiver.isNotEmpty &&
-          receiver.toLowerCase() != meLower &&
-          receiver.toLowerCase() != 'sistema test') {
-        displayNamesByLower.putIfAbsent(receiver.toLowerCase(), () => receiver);
-      }
-
-      // Verificar si es un mensaje 1:1 conmigo
-      final senderLower = sender.toLowerCase();
-      final receiverLower = receiver.toLowerCase();
-
-      if (senderLower == meLower && receiverLower.isNotEmpty && receiverLower != meLower) {
-        lastMsgByOtherUser[receiverLower] = normalized;
-      } else if (receiverLower == meLower && senderLower.isNotEmpty && senderLower != meLower) {
-        lastMsgByOtherUser[senderLower] = normalized;
-      }
+    } catch (e) {
+      debugPrint('[DirectChatRepository] Error al consultar mensajes para resumen: $e');
     }
 
     final List<DirectChatContact> contacts = [];
-    for (final entry in displayNamesByLower.entries) {
-      final otherLower = entry.key;
+    for (final entry in profilesById.entries) {
+      final otherId = entry.key;
       final displayName = entry.value;
-      final lastMsg = lastMsgByOtherUser[otherLower];
+      final lastMsg = lastMsgByOtherId[otherId];
+
+      final lastSenderId = (lastMsg?['sender_id'] ?? '').toString();
+      final isFromMe = lastMsg != null &&
+          (lastSenderId == currentUserId ||
+              (lastSenderId.isEmpty &&
+                  (lastMsg['sender_name'] ?? '').toString().trim().toLowerCase() ==
+                      currentUserName.trim().toLowerCase()));
 
       contacts.add(
         DirectChatContact(
+          userId: otherId,
           username: displayName,
           lastMessage: lastMsg?['content']?.toString(),
           lastTimestamp: lastMsg?['created_at']?.toString(),
           lastMessageId: lastMsg?['id'] as int?,
-          isLastFromMe: lastMsg != null &&
-              (lastMsg['sender_name'] ?? '').toString().trim().toLowerCase() == meLower,
+          isLastFromMe: isFromMe,
         ),
       );
     }
 
-    // Ordenar: conversaciones con mensajes más recientes primero, luego alfabéticamente
+    // Ordenar conversaciones con mensajes más recientes primero, luego alfabéticamente
     contacts.sort((a, b) {
       if (a.lastMessageId != null && b.lastMessageId != null) {
         return b.lastMessageId!.compareTo(a.lastMessageId!);
@@ -211,10 +285,12 @@ class DirectChatRepository {
     return contacts;
   }
 
-  /// Obtiene el historial de mensajes 1:1 entre `currentUser` y `otherUser`.
+  /// Obtiene el historial de mensajes 1:1 entre `currentUserId` y `otherUserId`.
   Future<List<Map<String, dynamic>>> fetchDirectMessages({
-    required String currentUser,
-    required String otherUser,
+    required String currentUserId,
+    required String otherUserId,
+    String? currentUserName,
+    String? otherUserName,
   }) async {
     final data = await SupabaseConfig.client
         .from(SupabaseConfig.tableMessages)
@@ -224,49 +300,34 @@ class DirectChatRepository {
     final List<Map<String, dynamic>> result = [];
     for (final raw in (data as List)) {
       final normalized = normalizeMessage(Map<String, dynamic>.from(raw as Map));
-      if (normalized != null && isMessageBetween(normalized, currentUser, otherUser)) {
+      if (normalized != null &&
+          isMessageBetween(
+            normalizedMsg: normalized,
+            currentUserId: currentUserId,
+            otherUserId: otherUserId,
+            currentUserName: currentUserName,
+            otherUserName: otherUserName,
+          )) {
         result.add(normalized);
       }
     }
     return result;
   }
 
-  /// Envía un mensaje 1:1 desde `sender` hacia `receiver`.
+  /// Envía un mensaje 1:1 vinculando `sender_id` y `receiver_id` de forma inmutable.
   Future<Map<String, dynamic>> sendDirectMessage({
-    required String sender,
-    required String receiver,
+    required String senderId,
+    required String receiverId,
+    required String senderName,
     required String content,
   }) async {
-    final cleanSender = sender.trim();
-    final cleanReceiver = receiver.trim();
-    final cleanContent = content.trim();
-
-    if (_hasReceiverColumn != false) {
-      try {
-        final inserted = await SupabaseConfig.client
-            .from(SupabaseConfig.tableMessages)
-            .insert({
-              'sender_name': cleanSender,
-              'receiver_name': cleanReceiver,
-              'content': cleanContent,
-            })
-            .select()
-            .single();
-        _hasReceiverColumn = true;
-        return normalizeMessage(Map<String, dynamic>.from(inserted))!;
-      } catch (e) {
-        debugPrint('[DirectChatRepository] Columna receiver_name no encontrada, usando formato 1:1 compatible: $e');
-        _hasReceiverColumn = false;
-      }
-    }
-
-    // Fallback compatible con esquema sin columna receiver_name
-    final encodedContent = '@[$cleanReceiver]: $cleanContent';
     final inserted = await SupabaseConfig.client
         .from(SupabaseConfig.tableMessages)
         .insert({
-          'sender_name': cleanSender,
-          'content': encodedContent,
+          'sender_id': senderId,
+          'receiver_id': receiverId,
+          'sender_name': senderName.trim(),
+          'content': content.trim(),
         })
         .select()
         .single();

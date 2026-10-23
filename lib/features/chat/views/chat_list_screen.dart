@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/supabase/supabase_config.dart';
@@ -10,7 +9,7 @@ import '../../ui_showcase/views/showcase_home_view.dart';
 import '../services/direct_chat_repository.dart';
 import 'real_chat_screen.dart';
 
-/// Pantalla principal de directorio y conversaciones 1:1.
+/// Pantalla principal de directorio y conversaciones 1:1 basadas en ID único inmutable (`user_id`).
 class ChatListScreen extends StatefulWidget {
   const ChatListScreen({super.key});
 
@@ -25,6 +24,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
   RealtimeChannel? _realtimeChannel;
   Timer? _syncTimer;
 
+  String _currentUserId = '';
   String _currentUserName = '';
   String _searchQuery = '';
   bool _isLoadingUser = true;
@@ -43,9 +43,12 @@ class _ChatListScreenState extends State<ChatListScreen> {
   }
 
   Future<void> _initDirectory() async {
-    await _loadUserName();
-    if (_currentUserName.isNotEmpty) {
-      await DirectChatRepository.instance.registerOrUpdateUser(_currentUserName);
+    await _loadUserIdentity();
+    if (_currentUserId.isNotEmpty && _currentUserName.isNotEmpty) {
+      await DirectChatRepository.instance.registerOrUpdateUser(
+        userId: _currentUserId,
+        username: _currentUserName,
+      );
       await _fetchContacts();
     }
     _subscribeToRealtime();
@@ -63,7 +66,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
   void _startBackgroundSync() {
     _syncTimer?.cancel();
     _syncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (_currentUserName.isNotEmpty) {
+      if (_currentUserId.isNotEmpty && _currentUserName.isNotEmpty) {
         _fetchContacts();
       }
     });
@@ -79,7 +82,17 @@ class _ChatListScreenState extends State<ChatListScreen> {
           schema: 'public',
           table: SupabaseConfig.tableMessages,
           callback: (_) {
-            if (_currentUserName.isNotEmpty) {
+            if (_currentUserId.isNotEmpty && _currentUserName.isNotEmpty) {
+              _fetchContacts();
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: SupabaseConfig.tableProfiles,
+          callback: (_) {
+            if (_currentUserId.isNotEmpty && _currentUserName.isNotEmpty) {
               _fetchContacts();
             }
           },
@@ -87,20 +100,22 @@ class _ChatListScreenState extends State<ChatListScreen> {
         .subscribe();
   }
 
-  Future<void> _loadUserName() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedName = prefs.getString('chat_username');
+  Future<void> _loadUserIdentity() async {
+    final userId = await DirectChatRepository.instance.ensureLocalUserId();
+    final savedName = await DirectChatRepository.instance.getLocalUserName();
 
-    if (savedName != null && savedName.trim().isNotEmpty) {
+    if (savedName.isNotEmpty) {
       if (mounted) {
         setState(() {
-          _currentUserName = savedName.trim();
+          _currentUserId = userId;
+          _currentUserName = savedName;
           _isLoadingUser = false;
         });
       }
     } else {
       if (mounted) {
         setState(() {
+          _currentUserId = userId;
           _isLoadingUser = false;
           _isLoadingContacts = false;
         });
@@ -114,11 +129,13 @@ class _ChatListScreenState extends State<ChatListScreen> {
   }
 
   Future<void> _fetchContacts() async {
-    if (_currentUserName.isEmpty) return;
+    if (_currentUserId.isEmpty || _currentUserName.isEmpty) return;
 
     try {
-      final fetched = await DirectChatRepository.instance
-          .fetchContactsWithLastMessage(_currentUserName);
+      final fetched = await DirectChatRepository.instance.fetchContactsWithLastMessage(
+        currentUserId: _currentUserId,
+        currentUserName: _currentUserName,
+      );
 
       if (!mounted) return;
       setState(() {
@@ -155,20 +172,33 @@ class _ChatListScreenState extends State<ChatListScreen> {
             ),
             content: Form(
               key: formKey,
-              child: TextFormField(
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  hintText: 'Ej. Juan, María, Briel...',
-                  labelText: 'Tu nombre de usuario único',
-                  helperText: 'Otros usuarios te encontrarán con este nombre',
-                ),
-                validator: (val) {
-                  if (val == null || val.trim().isEmpty) {
-                    return 'Por favor ingresa tu nombre de usuario';
-                  }
-                  return null;
-                },
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextFormField(
+                    controller: controller,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      hintText: 'Ej. Juan, María, Briel...',
+                      labelText: 'Tu nombre visible',
+                      helperText: 'Puedes cambiarlo cuando quieras sin perder tus chats',
+                    ),
+                    validator: (val) {
+                      if (val == null || val.trim().isEmpty) {
+                        return 'Por favor ingresa tu nombre de usuario';
+                      }
+                      return null;
+                    },
+                  ),
+                  if (_currentUserId.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      'ID único: ${_currentUserId.substring(0, 8)}...',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ],
+                ],
               ),
             ),
             actions: [
@@ -181,20 +211,20 @@ class _ChatListScreenState extends State<ChatListScreen> {
                 onPressed: () async {
                   if (formKey.currentState?.validate() ?? false) {
                     final newName = controller.text.trim();
-                    final prefs = await SharedPreferences.getInstance();
-                    await prefs.setString('chat_username', newName);
                     if (mounted) {
                       setState(() {
                         _currentUserName = newName;
-                        _isLoadingContacts = true;
                       });
                     }
                     if (ctx.mounted) Navigator.of(ctx).pop();
-                    await DirectChatRepository.instance.registerOrUpdateUser(newName);
+                    await DirectChatRepository.instance.registerOrUpdateUser(
+                      userId: _currentUserId,
+                      username: newName,
+                    );
                     await _fetchContacts();
                   }
                 },
-                child: const Text('Guardar y Conectar'),
+                child: const Text('Guardar'),
               ),
             ],
           ),
@@ -206,60 +236,83 @@ class _ChatListScreenState extends State<ChatListScreen> {
   Future<void> _promptNewDirectChat() async {
     final controller = TextEditingController();
     final formKey = GlobalKey<FormState>();
+    String? errorText;
 
     await showDialog(
       context: context,
       builder: (ctx) {
-        return AlertDialog(
-          title: const Row(
-            children: [
-              Icon(Icons.person_add_alt_1, color: AppTheme.primaryColor),
-              SizedBox(width: 8),
-              Text('Nuevo Chat 1:1'),
-            ],
-          ),
-          content: Form(
-            key: formKey,
-            child: TextFormField(
-              controller: controller,
-              autofocus: true,
-              decoration: const InputDecoration(
-                hintText: 'Nombre del usuario destino...',
-                labelText: '¿Con quién deseas chatear?',
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Row(
+                children: [
+                  Icon(Icons.person_add_alt_1, color: AppTheme.primaryColor),
+                  SizedBox(width: 8),
+                  Text('Buscar Usuario'),
+                ],
               ),
-              validator: (val) {
-                if (val == null || val.trim().isEmpty) {
-                  return 'Ingresa el nombre del usuario';
-                }
-                if (val.trim().toLowerCase() == _currentUserName.trim().toLowerCase()) {
-                  return 'Ingresa un usuario distinto al tuyo';
-                }
-                return null;
-              },
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Cancelar'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                if (formKey.currentState?.validate() ?? false) {
-                  final targetUser = controller.text.trim();
-                  Navigator.of(ctx).pop();
-                  _openChatWith(targetUser);
-                }
-              },
-              child: const Text('Abrir Chat'),
-            ),
-          ],
+              content: Form(
+                key: formKey,
+                child: TextFormField(
+                  controller: controller,
+                  autofocus: true,
+                  decoration: InputDecoration(
+                    hintText: 'Nombre del usuario registrado...',
+                    labelText: '¿Con quién deseas chatear?',
+                    errorText: errorText,
+                  ),
+                  validator: (val) {
+                    if (val == null || val.trim().isEmpty) {
+                      return 'Ingresa el nombre del usuario';
+                    }
+                    return null;
+                  },
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Cancelar'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    if (formKey.currentState?.validate() ?? false) {
+                      final targetName = controller.text.trim();
+                      final profile =
+                          await DirectChatRepository.instance.findProfileByUsername(targetName);
+                      if (profile == null) {
+                        setDialogState(() {
+                          errorText = 'Usuario "$targetName" aún no registrado';
+                        });
+                        return;
+                      }
+                      if (profile['id'] == _currentUserId) {
+                        setDialogState(() {
+                          errorText = 'Ese es tu propio usuario';
+                        });
+                        return;
+                      }
+                      if (ctx.mounted) Navigator.of(ctx).pop();
+                      _openChatWith(
+                        recipientUserId: profile['id']!,
+                        recipientName: profile['username']!,
+                      );
+                    }
+                  },
+                  child: const Text('Abrir Chat'),
+                ),
+              ],
+            );
+          },
         );
       },
     );
   }
 
-  Future<void> _openChatWith(String recipientName) async {
+  Future<void> _openChatWith({
+    required String recipientUserId,
+    required String recipientName,
+  }) async {
     if (_currentUserName.isEmpty) {
       await _promptForUserName(canCancel: false);
       if (_currentUserName.isEmpty) return;
@@ -269,7 +322,9 @@ class _ChatListScreenState extends State<ChatListScreen> {
     await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => RealChatScreen(
+          currentUserId: _currentUserId,
           currentUserName: _currentUserName,
+          recipientUserId: recipientUserId,
           recipientName: recipientName,
         ),
       ),
@@ -294,7 +349,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
     }
   }
 
-  Color _avatarColorFor(String name) {
+  Color _avatarColorFor(String idOrName) {
     final palette = [
       Colors.indigo,
       Colors.teal,
@@ -304,7 +359,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
       Colors.pink.shade700,
       Colors.cyan.shade700,
     ];
-    final hash = name.toLowerCase().codeUnits.fold<int>(0, (p, c) => p + c);
+    final hash = idOrName.toLowerCase().codeUnits.fold<int>(0, (p, c) => p + c);
     return palette[hash % palette.length];
   }
 
@@ -361,7 +416,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.manage_accounts_outlined),
-            tooltip: 'Cambiar mi usuario',
+            tooltip: 'Cambiar mi nombre',
             onPressed: () => _promptForUserName(canCancel: true),
           ),
           PopupMenuButton<String>(
@@ -455,15 +510,9 @@ class _ChatListScreenState extends State<ChatListScreen> {
                                       ),
                                       const SizedBox(height: 8),
                                       const Text(
-                                        'Abre la app en otro dispositivo o presiona "Nuevo Chat" para escribir directamente a un usuario.',
+                                        'En cuanto otro dispositivo abra la aplicación, aparecerá aquí automáticamente con su ID único.',
                                         textAlign: TextAlign.center,
                                         style: TextStyle(fontSize: 13, color: Colors.grey),
-                                      ),
-                                      const SizedBox(height: 16),
-                                      ElevatedButton.icon(
-                                        onPressed: _promptNewDirectChat,
-                                        icon: const Icon(Icons.chat_outlined),
-                                        label: const Text('Iniciar chat con un usuario'),
                                       ),
                                     ],
                                   ),
@@ -491,7 +540,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
                                 ),
                                 leading: CircleAvatar(
                                   radius: 24,
-                                  backgroundColor: _avatarColorFor(contact.username),
+                                  backgroundColor: _avatarColorFor(contact.userId),
                                   child: Text(
                                     initial,
                                     style: const TextStyle(
@@ -545,7 +594,10 @@ class _ChatListScreenState extends State<ChatListScreen> {
                                     ),
                                   ],
                                 ),
-                                onTap: () => _openChatWith(contact.username),
+                                onTap: () => _openChatWith(
+                                  recipientUserId: contact.userId,
+                                  recipientName: contact.username,
+                                ),
                               );
                             },
                           ),
@@ -556,7 +608,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _promptNewDirectChat,
         icon: const Icon(Icons.chat),
-        label: const Text('Nuevo Chat'),
+        label: const Text('Buscar Usuario'),
       ),
     );
   }

@@ -1,21 +1,24 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/supabase/supabase_config.dart';
 import '../../../core/theme/app_theme.dart';
 import '../services/direct_chat_repository.dart';
 
-/// Pantalla de conversación privada 1:1 en tiempo real con un usuario específico.
+/// Pantalla de conversación privada 1:1 en tiempo real vinculada por ID único inmutable (`UUID`).
 class RealChatScreen extends StatefulWidget {
+  final String currentUserId;
   final String currentUserName;
+  final String recipientUserId;
   final String recipientName;
 
   const RealChatScreen({
     super.key,
+    required this.currentUserId,
     required this.currentUserName,
+    required this.recipientUserId,
     required this.recipientName,
   });
 
@@ -31,14 +34,18 @@ class _RealChatScreenState extends State<RealChatScreen> {
   RealtimeChannel? _realtimeChannel;
   Timer? _syncTimer;
 
+  late String _currentUserId;
   late String _currentUserName;
+  late String _recipientName;
   bool _isLoadingMessages = true;
   bool _isSending = false;
 
   @override
   void initState() {
     super.initState();
+    _currentUserId = widget.currentUserId;
     _currentUserName = widget.currentUserName;
+    _recipientName = widget.recipientName;
     _initChat();
   }
 
@@ -50,9 +57,6 @@ class _RealChatScreenState extends State<RealChatScreen> {
   }
 
   void _initChat() {
-    if (_currentUserName.isEmpty) {
-      _loadUserName();
-    }
     _fetchMessages();
     _subscribeToRealtime();
     _startBackgroundSync();
@@ -67,31 +71,43 @@ class _RealChatScreenState extends State<RealChatScreen> {
     super.dispose();
   }
 
-  Future<void> _loadUserName() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedName = prefs.getString('chat_username');
-    if (savedName != null && savedName.trim().isNotEmpty && mounted) {
-      setState(() {
-        _currentUserName = savedName.trim();
-      });
-      _fetchMessages();
-    }
-  }
-
   void _startBackgroundSync() {
     _syncTimer?.cancel();
     _syncTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _fetchMessages();
+      _refreshRecipientProfile();
     });
   }
 
+  Future<void> _refreshRecipientProfile() async {
+    if (widget.recipientUserId.isEmpty) return;
+    try {
+      final data = await SupabaseConfig.client
+          .from(SupabaseConfig.tableProfiles)
+          .select('username')
+          .eq('id', widget.recipientUserId)
+          .maybeSingle();
+
+      if (data != null && mounted) {
+        final updatedName = (data['username'] ?? '').toString().trim();
+        if (updatedName.isNotEmpty && updatedName != _recipientName) {
+          setState(() {
+            _recipientName = updatedName;
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
   Future<void> _fetchMessages() async {
-    if (_currentUserName.isEmpty) return;
+    if (_currentUserId.isEmpty) return;
 
     try {
       final fetchedList = await DirectChatRepository.instance.fetchDirectMessages(
-        currentUser: _currentUserName,
-        otherUser: widget.recipientName,
+        currentUserId: _currentUserId,
+        otherUserId: widget.recipientUserId,
+        currentUserName: _currentUserName,
+        otherUserName: _recipientName,
       );
 
       if (!mounted) return;
@@ -137,12 +153,30 @@ class _RealChatScreenState extends State<RealChatScreen> {
                 final normalized = DirectChatRepository.instance.normalizeMessage(raw);
                 if (normalized != null &&
                     DirectChatRepository.instance.isMessageBetween(
-                      normalized,
-                      _currentUserName,
-                      widget.recipientName,
+                      normalizedMsg: normalized,
+                      currentUserId: _currentUserId,
+                      otherUserId: widget.recipientUserId,
+                      currentUserName: _currentUserName,
+                      otherUserName: _recipientName,
                     )) {
                   _addOrUpdateMessage(normalized);
                 }
+              }
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.update,
+          schema: 'public',
+          table: SupabaseConfig.tableProfiles,
+          callback: (payload) {
+            final updated = payload.newRecord;
+            if (updated['id']?.toString() == widget.recipientUserId) {
+              final newName = (updated['username'] ?? '').toString().trim();
+              if (newName.isNotEmpty && mounted) {
+                setState(() {
+                  _recipientName = newName;
+                });
               }
             }
           },
@@ -180,7 +214,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   Future<void> _sendMessage() async {
     final text = _textController.text.trim();
-    if (text.isEmpty || _isSending || _currentUserName.isEmpty) return;
+    if (text.isEmpty || _isSending || _currentUserId.isEmpty) return;
 
     setState(() {
       _isSending = true;
@@ -190,8 +224,9 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
     try {
       final inserted = await DirectChatRepository.instance.sendDirectMessage(
-        sender: _currentUserName,
-        receiver: widget.recipientName,
+        senderId: _currentUserId,
+        receiverId: widget.recipientUserId,
+        senderName: _currentUserName,
         content: text,
       );
 
@@ -227,8 +262,8 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final recipientInitial = widget.recipientName.isNotEmpty
-        ? widget.recipientName[0].toUpperCase()
+    final recipientInitial = _recipientName.isNotEmpty
+        ? _recipientName[0].toUpperCase()
         : '?';
 
     return Scaffold(
@@ -253,16 +288,16 @@ class _RealChatScreenState extends State<RealChatScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    widget.recipientName,
+                    _recipientName,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                   ),
                   const Row(
                     children: [
-                      Icon(Icons.lock_outline, size: 11, color: Colors.greenAccent),
+                      Icon(Icons.verified_user_outlined, size: 11, color: Colors.greenAccent),
                       SizedBox(width: 4),
                       Text(
-                        'Chat 1:1 en tiempo real',
+                        'Chat 1:1 vinculado por ID único',
                         style: TextStyle(fontSize: 11, color: Colors.white70),
                       ),
                     ],
@@ -304,7 +339,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                       ),
                                       const SizedBox(height: 12),
                                       Text(
-                                        'Conversación 1:1 con ${widget.recipientName}',
+                                        'Conversación 1:1 con $_recipientName',
                                         textAlign: TextAlign.center,
                                         style: const TextStyle(
                                           fontSize: 16,
@@ -314,7 +349,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                       ),
                                       const SizedBox(height: 4),
                                       const Text(
-                                        'Envía un mensaje directo para iniciar el chat privado.',
+                                        'Los mensajes quedan vinculados a su ID único aunque cambien de nombre.',
                                         textAlign: TextAlign.center,
                                         style: TextStyle(fontSize: 13, color: Colors.grey),
                                       ),
@@ -331,11 +366,15 @@ class _RealChatScreenState extends State<RealChatScreen> {
                             itemCount: _messages.length,
                             itemBuilder: (context, index) {
                               final msg = _messages[index];
-                              final sender = (msg['sender_name'] ?? 'Anónimo').toString();
+                              final msgSenderId = (msg['sender_id'] ?? '').toString();
+                              final senderName = (msg['sender_name'] ?? 'Anónimo').toString();
                               final content = (msg['content'] ?? '').toString();
                               final timestamp = _formatTimestamp(msg['created_at']?.toString());
-                              final isMe = sender.trim().toLowerCase() ==
-                                  _currentUserName.trim().toLowerCase();
+
+                              final isMe = msgSenderId.isNotEmpty
+                                  ? msgSenderId == _currentUserId
+                                  : senderName.trim().toLowerCase() ==
+                                      _currentUserName.trim().toLowerCase();
 
                               return Align(
                                 alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
@@ -415,7 +454,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
                       controller: _textController,
                       textCapitalization: TextCapitalization.sentences,
                       decoration: InputDecoration(
-                        hintText: 'Mensaje para ${widget.recipientName}...',
+                        hintText: 'Mensaje para $_recipientName...',
                         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(24),
