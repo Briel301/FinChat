@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -7,7 +10,8 @@ import '../../../core/supabase/supabase_config.dart';
 import '../../../core/theme/app_theme.dart';
 import '../services/direct_chat_repository.dart';
 
-/// Pantalla de conversación privada 1:1 en tiempo real vinculada por ID único inmutable (`UUID`).
+/// Pantalla de conversación privada 1:1 en tiempo real vinculada por ID único inmutable (`UUID`)
+/// con soporte para envío y visualización de imágenes desde galería y cámara.
 class RealChatScreen extends StatefulWidget {
   final String currentUserId;
   final String currentUserName;
@@ -29,6 +33,7 @@ class RealChatScreen extends StatefulWidget {
 class _RealChatScreenState extends State<RealChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final ImagePicker _imagePicker = ImagePicker();
 
   List<Map<String, dynamic>> _messages = [];
   RealtimeChannel? _realtimeChannel;
@@ -39,6 +44,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
   late String _recipientName;
   bool _isLoadingMessages = true;
   bool _isSending = false;
+  bool _isUploadingMedia = false;
 
   @override
   void initState() {
@@ -112,7 +118,6 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
       if (!mounted) return;
 
-      // Comprobar si hay cambios reales para no reconstruir ni mover el scroll innecesariamente
       bool hasChanges = fetchedList.length != _messages.length;
       if (!hasChanges && fetchedList.isNotEmpty && _messages.isNotEmpty) {
         hasChanges = fetchedList.last['id'] != _messages.last['id'];
@@ -250,6 +255,243 @@ class _RealChatScreenState extends State<RealChatScreen> {
     }
   }
 
+  /// Comprime los bytes de imagen en plataformas móviles (Android/iOS) con fallback seguro en Desktop.
+  Future<Uint8List> _compressImageBytes(Uint8List rawBytes) async {
+    if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS)) {
+      try {
+        final compressed = await FlutterImageCompress.compressWithList(
+          rawBytes,
+          minWidth: 1280,
+          minHeight: 1280,
+          quality: 78,
+        );
+        if (compressed.isNotEmpty && compressed.length < rawBytes.length) {
+          return compressed;
+        }
+      } catch (e) {
+        debugPrint('[RealChatScreen] Compresión nativa omitida, usando bytes originales: $e');
+      }
+    }
+    return rawBytes;
+  }
+
+  /// Permite seleccionar una imagen de la galería o tomar una foto con la cámara,
+  /// previsualizarla, añadir un comentario opcional y enviarla a la conversación.
+  Future<void> _pickAndSendImage(ImageSource source) async {
+    if (_isUploadingMedia || _currentUserId.isEmpty) return;
+
+    try {
+      final XFile? picked = await _imagePicker.pickImage(
+        source: source,
+        maxWidth: 1600,
+        maxHeight: 1600,
+        imageQuality: 85,
+      );
+
+      if (picked == null || !mounted) return;
+
+      final rawBytes = await picked.readAsBytes();
+      if (!mounted) return;
+
+      final captionController = TextEditingController(text: _textController.text.trim());
+      final bool? shouldSend = await showDialog<bool>(
+        context: context,
+        builder: (ctx) {
+          final kbSize = (rawBytes.length / 1024).toStringAsFixed(1);
+          return AlertDialog(
+            title: Row(
+              children: [
+                Icon(
+                  source == ImageSource.camera ? Icons.camera_alt : Icons.photo_library,
+                  color: AppTheme.primaryColor,
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Enviar imagen',
+                    style: TextStyle(fontSize: 18),
+                  ),
+                ),
+              ],
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      child: Image.memory(
+                        rawBytes,
+                        fit: BoxFit.cover,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Tamaño: $kbSize KB',
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: captionController,
+                    decoration: const InputDecoration(
+                      hintText: 'Añadir un comentario (opcional)...',
+                      prefixIcon: Icon(Icons.chat_bubble_outline, size: 20),
+                    ),
+                    textCapitalization: TextCapitalization.sentences,
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Cancelar'),
+              ),
+              FilledButton.icon(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                icon: const Icon(Icons.send, size: 18),
+                label: const Text('Enviar'),
+              ),
+            ],
+          );
+        },
+      );
+
+      if (shouldSend != true || !mounted) return;
+
+      final caption = captionController.text.trim();
+      _textController.clear();
+
+      setState(() {
+        _isUploadingMedia = true;
+      });
+
+      final optimizedBytes = await _compressImageBytes(rawBytes);
+      final ext = picked.name.contains('.') ? picked.name.split('.').last.toLowerCase() : 'jpg';
+      final contentType = ext == 'png'
+          ? 'image/png'
+          : ext == 'webp'
+              ? 'image/webp'
+              : 'image/jpeg';
+
+      final publicUrl = await DirectChatRepository.instance.uploadMediaBytes(
+        bucket: SupabaseConfig.bucketChatImages,
+        bytes: optimizedBytes,
+        fileName: picked.name.isNotEmpty ? picked.name : 'photo.jpg',
+        contentType: contentType,
+      );
+
+      final inserted = await DirectChatRepository.instance.sendDirectMessage(
+        senderId: _currentUserId,
+        receiverId: widget.recipientUserId,
+        senderName: _currentUserName,
+        content: caption,
+        mediaUrl: publicUrl,
+        mediaType: 'image',
+        fileSizeBytes: optimizedBytes.length,
+      );
+
+      _addOrUpdateMessage(inserted);
+    } on UnsupportedError catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'La cámara directa no está disponible en este entorno de escritorio. Prueba en Android o usa la Galería.',
+            ),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('[RealChatScreen] Error al subir/enviar imagen: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al enviar imagen: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUploadingMedia = false;
+        });
+      }
+    }
+  }
+
+  /// Abre un visor en pantalla completa con zoom para inspeccionar una imagen recibida o enviada.
+  void _openFullScreenImage(String imageUrl, String senderName, String caption) {
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return Dialog.fullscreen(
+          backgroundColor: Colors.black,
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            appBar: AppBar(
+              backgroundColor: Colors.black87,
+              foregroundColor: Colors.white,
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(senderName, style: const TextStyle(fontSize: 16)),
+                  if (caption.isNotEmpty)
+                    Text(
+                      caption,
+                      style: const TextStyle(fontSize: 12, color: Colors.white70),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                ],
+              ),
+              leading: IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+            ),
+            body: Center(
+              child: InteractiveViewer(
+                minScale: 0.8,
+                maxScale: 4.0,
+                child: Image.network(
+                  imageUrl,
+                  fit: BoxFit.contain,
+                  loadingBuilder: (context, child, progress) {
+                    if (progress == null) return child;
+                    return const Center(
+                      child: CircularProgressIndicator(color: Colors.white),
+                    );
+                  },
+                  errorBuilder: (context, error, stackTrace) {
+                    return const Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.broken_image_outlined, color: Colors.white54, size: 64),
+                        SizedBox(height: 12),
+                        Text(
+                          'No se pudo cargar la imagen',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   String _formatTimestamp(String? isoString) {
     if (isoString == null) return '';
     try {
@@ -258,6 +500,98 @@ class _RealChatScreenState extends State<RealChatScreen> {
     } catch (_) {
       return '';
     }
+  }
+
+  Widget _buildMessageContent({
+    required Map<String, dynamic> msg,
+    required bool isMe,
+  }) {
+    final content = (msg['content'] ?? '').toString();
+    final mediaUrl = msg['media_url']?.toString();
+    final mediaType = (msg['media_type'] ?? 'text').toString();
+    final senderName = (msg['sender_name'] ?? 'Usuario').toString();
+
+    final textColor = isMe
+        ? Colors.white
+        : Theme.of(context).textTheme.bodyLarge?.color;
+
+    if (mediaType == 'image' && mediaUrl != null && mediaUrl.isNotEmpty) {
+      return Column(
+        crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        children: [
+          GestureDetector(
+            onTap: () => _openFullScreenImage(mediaUrl, senderName, content),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(
+                  maxWidth: 240,
+                  maxHeight: 280,
+                  minWidth: 120,
+                  minHeight: 100,
+                ),
+                child: Image.network(
+                  mediaUrl,
+                  fit: BoxFit.cover,
+                  loadingBuilder: (context, child, loadingProgress) {
+                    if (loadingProgress == null) return child;
+                    return Container(
+                      width: 200,
+                      height: 160,
+                      color: Colors.black12,
+                      alignment: Alignment.center,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: isMe ? Colors.white : AppTheme.primaryColor,
+                      ),
+                    );
+                  },
+                  errorBuilder: (context, error, stackTrace) {
+                    return Container(
+                      width: 200,
+                      height: 120,
+                      padding: const EdgeInsets.all(12),
+                      color: Colors.black12,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.broken_image_outlined,
+                            color: isMe ? Colors.white70 : Colors.grey,
+                            size: 32,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Imagen no disponible',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: isMe ? Colors.white70 : Colors.grey,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+          if (content.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              content,
+              style: TextStyle(fontSize: 15, color: textColor),
+            ),
+          ],
+        ],
+      );
+    }
+
+    return Text(
+      content,
+      style: TextStyle(fontSize: 15, color: textColor),
+    );
   }
 
   @override
@@ -317,6 +651,11 @@ class _RealChatScreenState extends State<RealChatScreen> {
       ),
       body: Column(
         children: [
+          if (_isUploadingMedia)
+            const LinearProgressIndicator(
+              minHeight: 3,
+              backgroundColor: Colors.transparent,
+            ),
           Expanded(
             child: _isLoadingMessages
                 ? const Center(child: CircularProgressIndicator())
@@ -349,7 +688,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                       ),
                                       const SizedBox(height: 4),
                                       const Text(
-                                        'Los mensajes quedan vinculados a su ID único aunque cambien de nombre.',
+                                        'Envía mensajes de texto, fotos desde tu galería o capturadas con la cámara.',
                                         textAlign: TextAlign.center,
                                         style: TextStyle(fontSize: 13, color: Colors.grey),
                                       ),
@@ -368,7 +707,6 @@ class _RealChatScreenState extends State<RealChatScreen> {
                               final msg = _messages[index];
                               final msgSenderId = (msg['sender_id'] ?? '').toString();
                               final senderName = (msg['sender_name'] ?? 'Anónimo').toString();
-                              final content = (msg['content'] ?? '').toString();
                               final timestamp = _formatTimestamp(msg['created_at']?.toString());
 
                               final isMe = msgSenderId.isNotEmpty
@@ -384,7 +722,9 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                     maxWidth: MediaQuery.of(context).size.width * 0.75,
                                   ),
                                   padding: const EdgeInsets.symmetric(
-                                      horizontal: 14, vertical: 10),
+                                    horizontal: 12,
+                                    vertical: 10,
+                                  ),
                                   decoration: BoxDecoration(
                                     color: isMe
                                         ? AppTheme.primaryColor
@@ -411,15 +751,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                     crossAxisAlignment:
                                         isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
                                     children: [
-                                      Text(
-                                        content,
-                                        style: TextStyle(
-                                          fontSize: 15,
-                                          color: isMe
-                                              ? Colors.white
-                                              : Theme.of(context).textTheme.bodyLarge?.color,
-                                        ),
-                                      ),
+                                      _buildMessageContent(msg: msg, isMe: isMe),
                                       const SizedBox(height: 4),
                                       Text(
                                         timestamp,
@@ -437,10 +769,10 @@ class _RealChatScreenState extends State<RealChatScreen> {
                   ),
           ),
 
-          // Barra inferior de entrada de texto
+          // Barra inferior de entrada de texto y botones multimedia
           SafeArea(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
               decoration: BoxDecoration(
                 color: Theme.of(context).cardColor,
                 boxShadow: const [
@@ -449,6 +781,22 @@ class _RealChatScreenState extends State<RealChatScreen> {
               ),
               child: Row(
                 children: [
+                  IconButton(
+                    icon: const Icon(Icons.photo_library_outlined),
+                    tooltip: 'Seleccionar imagen de galería',
+                    color: AppTheme.primaryColor,
+                    onPressed: (_isUploadingMedia || _isSending)
+                        ? null
+                        : () => _pickAndSendImage(ImageSource.gallery),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.camera_alt_outlined),
+                    tooltip: 'Tomar foto con la cámara',
+                    color: AppTheme.primaryColor,
+                    onPressed: (_isUploadingMedia || _isSending)
+                        ? null
+                        : () => _pickAndSendImage(ImageSource.camera),
+                  ),
                   Expanded(
                     child: TextField(
                       controller: _textController,
@@ -468,10 +816,10 @@ class _RealChatScreenState extends State<RealChatScreen> {
                       onSubmitted: (_) => _sendMessage(),
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   IconButton.filled(
-                    onPressed: _isSending ? null : _sendMessage,
-                    icon: _isSending
+                    onPressed: (_isSending || _isUploadingMedia) ? null : _sendMessage,
+                    icon: (_isSending || _isUploadingMedia)
                         ? const SizedBox(
                             width: 20,
                             height: 20,

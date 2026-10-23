@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/supabase/supabase_config.dart';
 
@@ -7,7 +8,10 @@ import '../../../core/supabase/supabase_config.dart';
 class DirectChatContact {
   final String userId;
   final String username;
+  final String? avatarUrl;
+  final String? bio;
   final String? lastMessage;
+  final String? lastMediaType;
   final String? lastTimestamp;
   final int? lastMessageId;
   final bool isLastFromMe;
@@ -15,15 +19,18 @@ class DirectChatContact {
   const DirectChatContact({
     required this.userId,
     required this.username,
+    this.avatarUrl,
+    this.bio,
     this.lastMessage,
+    this.lastMediaType,
     this.lastTimestamp,
     this.lastMessageId,
     this.isLastFromMe = false,
   });
 }
 
-/// Repositorio para gestionar usuarios con ID único inmutable (`profiles.id`)
-/// y mensajes 1:1 vinculados por `sender_id` y `receiver_id`.
+/// Repositorio para gestionar usuarios con ID único inmutable (`profiles.id`),
+/// almacenamiento en Supabase Storage y mensajes 1:1 vinculados por `sender_id` y `receiver_id`.
 class DirectChatRepository {
   DirectChatRepository._();
   static final DirectChatRepository instance = DirectChatRepository._();
@@ -55,6 +62,8 @@ class DirectChatRepository {
   Future<void> registerOrUpdateUser({
     required String userId,
     required String username,
+    String? avatarUrl,
+    String? bio,
   }) async {
     final cleanName = username.trim();
     if (cleanName.isEmpty || userId.isEmpty) return;
@@ -62,21 +71,48 @@ class DirectChatRepository {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefUserNameKey, cleanName);
 
+    final Map<String, dynamic> payload = {
+      'id': userId,
+      'username': cleanName,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+    if (avatarUrl != null) payload['avatar_url'] = avatarUrl;
+    if (bio != null) payload['bio'] = bio.trim();
+
     try {
       await SupabaseConfig.client.from(SupabaseConfig.tableProfiles).upsert(
-        {
-          'id': userId,
-          'username': cleanName,
-          'updated_at': DateTime.now().toUtc().toIso8601String(),
-        },
-        onConflict: 'id',
-      );
+            payload,
+            onConflict: 'id',
+          );
     } catch (e) {
       debugPrint('[DirectChatRepository] Error al sincronizar perfil en profiles: $e');
     }
   }
 
-  /// Normaliza un registro de `messages`. Extrae `sender_id`, `receiver_id`, `sender_name` y `content`.
+  /// Sube un archivo binario (`Uint8List`) a un bucket de Supabase Storage y retorna su URL pública.
+  Future<String> uploadMediaBytes({
+    required String bucket,
+    required Uint8List bytes,
+    required String fileName,
+    String contentType = 'image/jpeg',
+  }) async {
+    final safeFileName = fileName.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    final storagePath = '${DateTime.now().millisecondsSinceEpoch}_${_uuid.v4().substring(0, 8)}_$safeFileName';
+
+    await SupabaseConfig.storage.from(bucket).uploadBinary(
+          storagePath,
+          bytes,
+          fileOptions: FileOptions(
+            contentType: contentType,
+            upsert: true,
+          ),
+        );
+
+    return SupabaseConfig.storage.from(bucket).getPublicUrl(storagePath);
+  }
+
+  /// Normaliza un registro de `messages`. Extrae `sender_id`, `receiver_id`, `sender_name`,
+  /// `content` y metadatos multimedia (`media_url`, `media_type`, `file_size_bytes`, `duration_seconds`).
   Map<String, dynamic>? normalizeMessage(Map<String, dynamic> raw) {
     final rawContent = (raw['content'] ?? '').toString();
     if (rawContent == _presenceMarker) {
@@ -98,6 +134,17 @@ class DirectChatRepository {
 
     if (senderId.isEmpty && senderName.isEmpty) return null;
 
+    final mediaUrl = raw['media_url']?.toString().trim();
+    final rawMediaType = (raw['media_type'] ?? '').toString().trim().toLowerCase();
+    final String mediaType;
+    if (rawMediaType.isNotEmpty) {
+      mediaType = rawMediaType;
+    } else if (mediaUrl != null && mediaUrl.isNotEmpty) {
+      mediaType = 'image';
+    } else {
+      mediaType = 'text';
+    }
+
     return {
       'id': raw['id'],
       'created_at': raw['created_at'],
@@ -106,7 +153,31 @@ class DirectChatRepository {
       'sender_name': senderName,
       'receiver_name': legacyReceiverName ?? '',
       'content': cleanContent,
+      'media_url': (mediaUrl != null && mediaUrl.isNotEmpty) ? mediaUrl : null,
+      'media_type': mediaType,
+      'file_size_bytes': raw['file_size_bytes'],
+      'duration_seconds': raw['duration_seconds'],
     };
+  }
+
+  /// Formatea el texto de vista previa de un mensaje para el listado de conversaciones.
+  String formatMessagePreview(Map<String, dynamic>? normalizedMsg) {
+    if (normalizedMsg == null) return '';
+    final mediaType = (normalizedMsg['media_type'] ?? 'text').toString();
+    final content = (normalizedMsg['content'] ?? '').toString().trim();
+
+    switch (mediaType) {
+      case 'image':
+        return content.isNotEmpty ? '📷 Foto: $content' : '📷 Foto';
+      case 'video':
+        return content.isNotEmpty ? '🎥 Video: $content' : '🎥 Video';
+      case 'audio':
+        final dur = normalizedMsg['duration_seconds'];
+        final durText = dur != null ? ' (${dur}s)' : '';
+        return '🎤 Nota de voz$durText';
+      default:
+        return content;
+    }
   }
 
   /// Verifica si un mensaje pertenece a la conversación 1:1 entre el usuario actual y el destinatario.
@@ -179,24 +250,28 @@ class DirectChatRepository {
     required String currentUserId,
     required String currentUserName,
   }) async {
-    // Mapa de userId -> username actual desde la tabla `profiles`
-    final Map<String, String> profilesById = {};
-    // Mapa auxiliar de username(lower) -> userId para vincular mensajes históricos sin UUID
+    final Map<String, Map<String, String?>> profilesById = {};
     final Map<String, String> userIdByLowerName = {};
 
     try {
       final profilesData = await SupabaseConfig.client
           .from(SupabaseConfig.tableProfiles)
-          .select('id, username')
+          .select()
           .order('username', ascending: true);
 
       for (final row in (profilesData as List)) {
         final id = (row['id'] ?? '').toString().trim();
         final uname = (row['username'] ?? '').toString().trim();
+        final avatarUrl = row['avatar_url']?.toString().trim();
+        final bio = row['bio']?.toString().trim();
         if (id.isNotEmpty && uname.isNotEmpty) {
           userIdByLowerName[uname.toLowerCase()] = id;
           if (id != currentUserId) {
-            profilesById[id] = uname;
+            profilesById[id] = {
+              'username': uname,
+              'avatar_url': (avatarUrl != null && avatarUrl.isNotEmpty) ? avatarUrl : null,
+              'bio': (bio != null && bio.isNotEmpty) ? bio : null,
+            };
           }
         }
       }
@@ -221,7 +296,6 @@ class DirectChatRepository {
         final sName = (normalized['sender_name'] ?? '').toString();
         final rName = (normalized['receiver_name'] ?? '').toString();
 
-        // Si es un mensaje antiguo sin UUID, intentar resolver el UUID por el nombre actual
         if (sId.isEmpty && sName.isNotEmpty) {
           sId = userIdByLowerName[sName.toLowerCase()] ?? '';
         }
@@ -229,12 +303,19 @@ class DirectChatRepository {
           rId = userIdByLowerName[rName.toLowerCase()] ?? '';
         }
 
-        // Si el mensaje involucra un UUID válido que aún no estaba en profilesById, registrarlo con su último nombre conocido
         if (sId.isNotEmpty && sId != currentUserId && !profilesById.containsKey(sId)) {
-          profilesById[sId] = sName.isNotEmpty ? sName : 'Usuario';
+          profilesById[sId] = {
+            'username': sName.isNotEmpty ? sName : 'Usuario',
+            'avatar_url': null,
+            'bio': null,
+          };
         }
         if (rId.isNotEmpty && rId != currentUserId && !profilesById.containsKey(rId)) {
-          profilesById[rId] = rName.isNotEmpty ? rName : 'Usuario';
+          profilesById[rId] = {
+            'username': rName.isNotEmpty ? rName : 'Usuario',
+            'avatar_url': null,
+            'bio': null,
+          };
         }
 
         if (sId == currentUserId && rId.isNotEmpty && rId != currentUserId) {
@@ -250,7 +331,8 @@ class DirectChatRepository {
     final List<DirectChatContact> contacts = [];
     for (final entry in profilesById.entries) {
       final otherId = entry.key;
-      final displayName = entry.value;
+      final profileInfo = entry.value;
+      final displayName = profileInfo['username'] ?? 'Usuario';
       final lastMsg = lastMsgByOtherId[otherId];
 
       final lastSenderId = (lastMsg?['sender_id'] ?? '').toString();
@@ -260,11 +342,16 @@ class DirectChatRepository {
                   (lastMsg['sender_name'] ?? '').toString().trim().toLowerCase() ==
                       currentUserName.trim().toLowerCase()));
 
+      final previewText = lastMsg != null ? formatMessagePreview(lastMsg) : null;
+
       contacts.add(
         DirectChatContact(
           userId: otherId,
           username: displayName,
-          lastMessage: lastMsg?['content']?.toString(),
+          avatarUrl: profileInfo['avatar_url'],
+          bio: profileInfo['bio'],
+          lastMessage: previewText,
+          lastMediaType: lastMsg?['media_type']?.toString(),
           lastTimestamp: lastMsg?['created_at']?.toString(),
           lastMessageId: lastMsg?['id'] as int?,
           isLastFromMe: isFromMe,
@@ -314,21 +401,31 @@ class DirectChatRepository {
     return result;
   }
 
-  /// Envía un mensaje 1:1 vinculando `sender_id` y `receiver_id` de forma inmutable.
+  /// Envía un mensaje 1:1 (texto o multimedia) vinculando `sender_id` y `receiver_id` de forma inmutable.
   Future<Map<String, dynamic>> sendDirectMessage({
     required String senderId,
     required String receiverId,
     required String senderName,
     required String content,
+    String? mediaUrl,
+    String mediaType = 'text',
+    int? fileSizeBytes,
+    int? durationSeconds,
   }) async {
+    final Map<String, dynamic> payload = {
+      'sender_id': senderId,
+      'receiver_id': receiverId,
+      'sender_name': senderName.trim(),
+      'content': content.trim(),
+      'media_type': mediaType,
+      if (mediaUrl != null && mediaUrl.isNotEmpty) 'media_url': mediaUrl,
+      if (fileSizeBytes != null) 'file_size_bytes': fileSizeBytes,
+      if (durationSeconds != null) 'duration_seconds': durationSeconds,
+    };
+
     final inserted = await SupabaseConfig.client
         .from(SupabaseConfig.tableMessages)
-        .insert({
-          'sender_id': senderId,
-          'receiver_id': receiverId,
-          'sender_name': senderName.trim(),
-          'content': content.trim(),
-        })
+        .insert(payload)
         .select()
         .single();
 
