@@ -1,4 +1,7 @@
+import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
@@ -8,6 +11,7 @@ import '../../../core/supabase/supabase_config.dart';
 class DirectChatContact {
   final String userId;
   final String username;
+  final String fullName;
   final String? avatarUrl;
   final String? bio;
   final String? lastMessage;
@@ -19,6 +23,7 @@ class DirectChatContact {
   const DirectChatContact({
     required this.userId,
     required this.username,
+    this.fullName = '',
     this.avatarUrl,
     this.bio,
     this.lastMessage,
@@ -30,16 +35,23 @@ class DirectChatContact {
 }
 
 /// Repositorio para gestionar usuarios con ID único inmutable (`profiles.id`),
-/// almacenamiento en Supabase Storage y mensajes 1:1 vinculados por `sender_id` y `receiver_id`.
+/// perfil con avatar e información básica, almacenamiento en Supabase Storage
+/// y mensajes 1:1 vinculados por `sender_id` y `receiver_id`.
 class DirectChatRepository {
   DirectChatRepository._();
   static final DirectChatRepository instance = DirectChatRepository._();
 
   static const String _prefUserIdKey = 'chat_user_id';
   static const String _prefUserNameKey = 'chat_username';
+  static const String _prefFullNameKey = 'chat_full_name';
+  static const String _prefBioKey = 'chat_bio';
+  static const String _prefAvatarUrlKey = 'chat_avatar_url';
+  static const String defaultBio = '¡Hola! Estoy usando FinChat.';
+
   static const String _presenceMarker = '__SYS_PRESENCE__';
   static final RegExp _legacyRecipientRegex = RegExp(r'^@\[([^\]]+)\]:\s*(.*)$', dotAll: true);
   static const Uuid _uuid = Uuid();
+  final ImagePicker _imagePicker = ImagePicker();
 
   /// Obtiene o genera el UUID único e inmutable de este dispositivo/usuario.
   Future<String> ensureLocalUserId() async {
@@ -58,26 +70,102 @@ class DirectChatRepository {
     return (prefs.getString(_prefUserNameKey) ?? '').trim();
   }
 
-  /// Guarda el nombre de usuario localmente y actualiza su perfil en Supabase manteniendo el mismo UUID.
+  /// Obtiene el nombre completo guardado localmente.
+  Future<String> getLocalFullName() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getString(_prefFullNameKey) ?? '').trim();
+  }
+
+  /// Obtiene la biografía/estado guardado localmente.
+  Future<String> getLocalBio() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = (prefs.getString(_prefBioKey) ?? '').trim();
+    return saved.isNotEmpty ? saved : defaultBio;
+  }
+
+  /// Obtiene la URL del avatar guardada localmente.
+  Future<String?> getLocalAvatarUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = (prefs.getString(_prefAvatarUrlKey) ?? '').trim();
+    return saved.isNotEmpty ? saved : null;
+  }
+
+  /// Consulta el perfil de un usuario en Supabase (`public.profiles`) por su `userId`.
+  Future<Map<String, dynamic>?> fetchUserProfile(
+    String userId, {
+    bool syncLocalIfCurrentUser = false,
+  }) async {
+    if (userId.trim().isEmpty) return null;
+    try {
+      final data = await SupabaseConfig.client
+          .from(SupabaseConfig.tableProfiles)
+          .select()
+          .eq('id', userId)
+          .maybeSingle();
+
+      if (data != null) {
+        final map = Map<String, dynamic>.from(data);
+        if (syncLocalIfCurrentUser) {
+          final prefs = await SharedPreferences.getInstance();
+          final uname = (map['username'] ?? '').toString().trim();
+          final fname = (map['full_name'] ?? '').toString().trim();
+          final bio = (map['bio'] ?? '').toString().trim();
+          final avatar = (map['avatar_url'] ?? '').toString().trim();
+
+          if (uname.isNotEmpty) await prefs.setString(_prefUserNameKey, uname);
+          await prefs.setString(_prefFullNameKey, fname);
+          if (bio.isNotEmpty) await prefs.setString(_prefBioKey, bio);
+          if (avatar.isNotEmpty) {
+            await prefs.setString(_prefAvatarUrlKey, avatar);
+          }
+        }
+        return map;
+      }
+    } catch (e) {
+      debugPrint('[DirectChatRepository] Error al obtener perfil de $userId: $e');
+    }
+    return null;
+  }
+
+  /// Guarda los datos del perfil localmente y actualiza su registro en `public.profiles`
+  /// manteniendo el mismo UUID inmutable.
   Future<void> registerOrUpdateUser({
     required String userId,
     required String username,
-    String? avatarUrl,
+    String? fullName,
     String? bio,
+    String? avatarUrl,
   }) async {
     final cleanName = username.trim();
     if (cleanName.isEmpty || userId.isEmpty) return;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefUserNameKey, cleanName);
+    if (fullName != null) {
+      await prefs.setString(_prefFullNameKey, fullName.trim());
+    }
+    if (bio != null) {
+      final effectiveBio = bio.trim().isNotEmpty ? bio.trim() : defaultBio;
+      await prefs.setString(_prefBioKey, effectiveBio);
+    }
+    if (avatarUrl != null) {
+      await prefs.setString(_prefAvatarUrlKey, avatarUrl.trim());
+    }
+
+    final savedFullName = fullName?.trim() ?? (prefs.getString(_prefFullNameKey) ?? '').trim();
+    final savedBio = bio?.trim() ?? (prefs.getString(_prefBioKey) ?? defaultBio).trim();
+    final savedAvatar = avatarUrl?.trim() ?? (prefs.getString(_prefAvatarUrlKey) ?? '').trim();
 
     final Map<String, dynamic> payload = {
       'id': userId,
       'username': cleanName,
+      'full_name': savedFullName,
+      'bio': savedBio.isNotEmpty ? savedBio : defaultBio,
       'updated_at': DateTime.now().toUtc().toIso8601String(),
     };
-    if (avatarUrl != null) payload['avatar_url'] = avatarUrl;
-    if (bio != null) payload['bio'] = bio.trim();
+    if (savedAvatar.isNotEmpty) {
+      payload['avatar_url'] = savedAvatar;
+    }
 
     try {
       await SupabaseConfig.client.from(SupabaseConfig.tableProfiles).upsert(
@@ -85,8 +173,95 @@ class DirectChatRepository {
             onConflict: 'id',
           );
     } catch (e) {
-      debugPrint('[DirectChatRepository] Error al sincronizar perfil en profiles: $e');
+      debugPrint('[DirectChatRepository] Error al sincronizar perfil completo, reintentando campos base: $e');
+      try {
+        await SupabaseConfig.client.from(SupabaseConfig.tableProfiles).upsert(
+          {
+            'id': userId,
+            'username': cleanName,
+            if (savedAvatar.isNotEmpty) 'avatar_url': savedAvatar,
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
+          },
+          onConflict: 'id',
+        );
+      } catch (innerError) {
+        debugPrint('[DirectChatRepository] Error al sincronizar perfil base: $innerError');
+      }
     }
+  }
+
+  /// Selecciona una imagen de la galería o captura una fotografía con la cámara.
+  /// En Android/iOS usa la cámara nativa; en Linux Desktop captura desde `/dev/video0` con `ffmpeg`.
+  Future<XFile?> pickOrCaptureImage(ImageSource source) async {
+    if (!kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.linux &&
+        source == ImageSource.camera) {
+      return _captureLinuxWebcamPhoto();
+    }
+
+    return _imagePicker.pickImage(
+      source: source,
+      maxWidth: 1600,
+      maxHeight: 1600,
+      imageQuality: 85,
+    );
+  }
+
+  /// Captura un fotograma desde la webcam `/dev/video0` en Linux usando `ffmpeg`.
+  Future<XFile?> _captureLinuxWebcamPhoto() async {
+    final tempPath =
+        '${Directory.systemTemp.path}/finchat_webcam_${DateTime.now().millisecondsSinceEpoch}.jpg';
+    try {
+      final result = await Process.run('ffmpeg', [
+        '-y',
+        '-f',
+        'v4l2',
+        '-i',
+        '/dev/video0',
+        '-frames:v',
+        '1',
+        tempPath,
+      ]);
+
+      final file = File(tempPath);
+      if (result.exitCode == 0 && await file.exists() && await file.length() > 0) {
+        return XFile(tempPath, name: 'webcam_photo.jpg', mimeType: 'image/jpeg');
+      } else {
+        throw StateError(
+          'No se pudo capturar desde /dev/video0 (código ${result.exitCode}). Verifica que la webcam no esté en uso por otra app.',
+        );
+      }
+    } catch (e) {
+      debugPrint('[DirectChatRepository] Error capturando webcam en Linux: $e');
+      rethrow;
+    }
+  }
+
+  /// Comprime bytes de imagen en Android/iOS con fallback seguro a los bytes originales en Desktop.
+  Future<Uint8List> compressImageBytes(
+    Uint8List rawBytes, {
+    int minWidth = 1080,
+    int minHeight = 1080,
+    int quality = 80,
+  }) async {
+    if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS)) {
+      try {
+        final compressed = await FlutterImageCompress.compressWithList(
+          rawBytes,
+          minWidth: minWidth,
+          minHeight: minHeight,
+          quality: quality,
+        );
+        if (compressed.isNotEmpty && compressed.length < rawBytes.length) {
+          return compressed;
+        }
+      } catch (e) {
+        debugPrint('[DirectChatRepository] Compresión nativa omitida: $e');
+      }
+    }
+    return rawBytes;
   }
 
   /// Sube un archivo binario (`Uint8List`) a un bucket de Supabase Storage y retorna su URL pública.
@@ -109,6 +284,44 @@ class DirectChatRepository {
         );
 
     return SupabaseConfig.storage.from(bucket).getPublicUrl(storagePath);
+  }
+
+  /// Sube una nueva imagen de avatar al bucket `avatars`, actualiza `profiles.avatar_url`
+  /// y retorna la URL pública resultante.
+  Future<String> uploadUserAvatar({
+    required String userId,
+    required String username,
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final compressed = await compressImageBytes(
+      bytes,
+      minWidth: 512,
+      minHeight: 512,
+      quality: 82,
+    );
+
+    final ext = fileName.contains('.') ? fileName.split('.').last.toLowerCase() : 'jpg';
+    final contentType = ext == 'png'
+        ? 'image/png'
+        : ext == 'webp'
+            ? 'image/webp'
+            : 'image/jpeg';
+
+    final publicUrl = await uploadMediaBytes(
+      bucket: SupabaseConfig.bucketAvatars,
+      bytes: compressed,
+      fileName: 'avatar_${userId.substring(0, 8)}.$ext',
+      contentType: contentType,
+    );
+
+    await registerOrUpdateUser(
+      userId: userId,
+      username: username,
+      avatarUrl: publicUrl,
+    );
+
+    return publicUrl;
   }
 
   /// Normaliza un registro de `messages`. Extrae `sender_id`, `receiver_id`, `sender_name`,
@@ -181,8 +394,6 @@ class DirectChatRepository {
   }
 
   /// Verifica si un mensaje pertenece a la conversación 1:1 entre el usuario actual y el destinatario.
-  /// Prioriza la comparación por UUID (`sender_id` / `receiver_id`), manteniendo soporte de lectura
-  /// para mensajes antiguos previos a la migración si coinciden los nombres.
   bool isMessageBetween({
     required Map<String, dynamic> normalizedMsg,
     required String currentUserId,
@@ -201,7 +412,6 @@ class DirectChatRepository {
           (msgSenderId == otherUserId && msgReceiverId == currentUserId);
     }
 
-    // Fallback sólo para mensajes históricos enviados sin UUID
     if (msgSenderId.isEmpty &&
         msgReceiverId.isEmpty &&
         currentUserName != null &&
@@ -245,7 +455,7 @@ class DirectChatRepository {
   }
 
   /// Obtiene la lista de usuarios registrados en `profiles` (excluyendo `currentUserId`)
-  /// junto con el último mensaje intercambiado por `userId`.
+  /// junto con su avatar, información básica y el último mensaje intercambiado por `userId`.
   Future<List<DirectChatContact>> fetchContactsWithLastMessage({
     required String currentUserId,
     required String currentUserName,
@@ -262,6 +472,7 @@ class DirectChatRepository {
       for (final row in (profilesData as List)) {
         final id = (row['id'] ?? '').toString().trim();
         final uname = (row['username'] ?? '').toString().trim();
+        final fullName = (row['full_name'] ?? '').toString().trim();
         final avatarUrl = row['avatar_url']?.toString().trim();
         final bio = row['bio']?.toString().trim();
         if (id.isNotEmpty && uname.isNotEmpty) {
@@ -269,6 +480,7 @@ class DirectChatRepository {
           if (id != currentUserId) {
             profilesById[id] = {
               'username': uname,
+              'full_name': fullName,
               'avatar_url': (avatarUrl != null && avatarUrl.isNotEmpty) ? avatarUrl : null,
               'bio': (bio != null && bio.isNotEmpty) ? bio : null,
             };
@@ -306,6 +518,7 @@ class DirectChatRepository {
         if (sId.isNotEmpty && sId != currentUserId && !profilesById.containsKey(sId)) {
           profilesById[sId] = {
             'username': sName.isNotEmpty ? sName : 'Usuario',
+            'full_name': '',
             'avatar_url': null,
             'bio': null,
           };
@@ -313,6 +526,7 @@ class DirectChatRepository {
         if (rId.isNotEmpty && rId != currentUserId && !profilesById.containsKey(rId)) {
           profilesById[rId] = {
             'username': rName.isNotEmpty ? rName : 'Usuario',
+            'full_name': '',
             'avatar_url': null,
             'bio': null,
           };
@@ -348,6 +562,7 @@ class DirectChatRepository {
         DirectChatContact(
           userId: otherId,
           username: displayName,
+          fullName: profileInfo['full_name'] ?? '',
           avatarUrl: profileInfo['avatar_url'],
           bio: profileInfo['bio'],
           lastMessage: previewText,
@@ -380,7 +595,9 @@ class DirectChatRepository {
     String? otherUserName,
   }) async {
     final data = await SupabaseConfig.client
-        .from(SupabaseConfig.tableMessages)
+        .from(SupabaseConfig.tableProfiles == 'profiles'
+            ? SupabaseConfig.tableMessages
+            : SupabaseConfig.tableMessages)
         .select()
         .order('id', ascending: true);
 

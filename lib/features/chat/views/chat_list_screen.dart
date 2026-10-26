@@ -6,10 +6,12 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../../core/supabase/supabase_config.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../ui_showcase/views/showcase_home_view.dart';
+import '../../users/views/user_profile_screen.dart';
 import '../services/direct_chat_repository.dart';
 import 'real_chat_screen.dart';
 
-/// Pantalla principal de directorio y conversaciones 1:1 basadas en ID único inmutable (`user_id`).
+/// Pantalla principal de directorio y conversaciones 1:1 basadas en ID único inmutable (`user_id`),
+/// con visualización de avatares e información de perfil en tiempo real.
 class ChatListScreen extends StatefulWidget {
   const ChatListScreen({super.key});
 
@@ -26,6 +28,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
 
   String _currentUserId = '';
   String _currentUserName = '';
+  String? _currentUserAvatarUrl;
   String _searchQuery = '';
   bool _isLoadingUser = true;
   bool _isLoadingContacts = true;
@@ -91,7 +94,11 @@ class _ChatListScreenState extends State<ChatListScreen> {
           event: PostgresChangeEvent.all,
           schema: 'public',
           table: SupabaseConfig.tableProfiles,
-          callback: (_) {
+          callback: (payload) {
+            final updated = payload.newRecord;
+            if (updated['id']?.toString() == _currentUserId) {
+              _refreshCurrentUserFromLocalOrRemote();
+            }
             if (_currentUserId.isNotEmpty && _currentUserName.isNotEmpty) {
               _fetchContacts();
             }
@@ -100,15 +107,32 @@ class _ChatListScreenState extends State<ChatListScreen> {
         .subscribe();
   }
 
+  Future<void> _refreshCurrentUserFromLocalOrRemote() async {
+    final name = await DirectChatRepository.instance.getLocalUserName();
+    final avatar = await DirectChatRepository.instance.getLocalAvatarUrl();
+    if (mounted) {
+      setState(() {
+        if (name.isNotEmpty) _currentUserName = name;
+        _currentUserAvatarUrl = avatar;
+      });
+    }
+  }
+
   Future<void> _loadUserIdentity() async {
     final userId = await DirectChatRepository.instance.ensureLocalUserId();
+    await DirectChatRepository.instance.fetchUserProfile(
+      userId,
+      syncLocalIfCurrentUser: true,
+    );
     final savedName = await DirectChatRepository.instance.getLocalUserName();
+    final savedAvatar = await DirectChatRepository.instance.getLocalAvatarUrl();
 
     if (savedName.isNotEmpty) {
       if (mounted) {
         setState(() {
           _currentUserId = userId;
           _currentUserName = savedName;
+          _currentUserAvatarUrl = savedAvatar;
           _isLoadingUser = false;
         });
       }
@@ -116,13 +140,14 @@ class _ChatListScreenState extends State<ChatListScreen> {
       if (mounted) {
         setState(() {
           _currentUserId = userId;
+          _currentUserAvatarUrl = savedAvatar;
           _isLoadingUser = false;
           _isLoadingContacts = false;
         });
       }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (_currentUserName.isEmpty && mounted) {
-          _promptForUserName(canCancel: false);
+          _openMyProfileScreen(isFirstSetup: true);
         }
       });
     }
@@ -152,84 +177,44 @@ class _ChatListScreenState extends State<ChatListScreen> {
     }
   }
 
-  Future<void> _promptForUserName({bool canCancel = true}) async {
-    final controller = TextEditingController(text: _currentUserName);
-    final formKey = GlobalKey<FormState>();
+  Future<void> _openMyProfileScreen({bool isFirstSetup = false}) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => UserProfileScreen(
+          userId: _currentUserId,
+          initialUsername: _currentUserName,
+          isFirstSetup: isFirstSetup,
+        ),
+      ),
+    );
 
-    await showDialog(
+    final updatedName = await DirectChatRepository.instance.getLocalUserName();
+    final updatedAvatar = await DirectChatRepository.instance.getLocalAvatarUrl();
+
+    if (mounted) {
+      setState(() {
+        if (updatedName.isNotEmpty) _currentUserName = updatedName;
+        _currentUserAvatarUrl = updatedAvatar;
+      });
+    }
+    if (_currentUserName.isNotEmpty) {
+      await _fetchContacts();
+    }
+  }
+
+  void _showContactProfileSheet(DirectChatContact contact) {
+    showModalBottomSheet(
       context: context,
-      barrierDismissible: canCancel,
-      builder: (ctx) {
-        return PopScope(
-          canPop: canCancel,
-          child: AlertDialog(
-            title: const Row(
-              children: [
-                Icon(Icons.person, color: AppTheme.primaryColor),
-                SizedBox(width: 8),
-                Text('Tu Perfil de Usuario'),
-              ],
-            ),
-            content: Form(
-              key: formKey,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextFormField(
-                    controller: controller,
-                    autofocus: true,
-                    decoration: const InputDecoration(
-                      hintText: 'Ej. Juan, María, Briel...',
-                      labelText: 'Tu nombre visible',
-                      helperText: 'Puedes cambiarlo cuando quieras sin perder tus chats',
-                    ),
-                    validator: (val) {
-                      if (val == null || val.trim().isEmpty) {
-                        return 'Por favor ingresa tu nombre de usuario';
-                      }
-                      return null;
-                    },
-                  ),
-                  if (_currentUserId.isNotEmpty) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      'ID único: ${_currentUserId.substring(0, 8)}...',
-                      style: const TextStyle(fontSize: 11, color: Colors.grey),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            actions: [
-              if (canCancel)
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('Cancelar'),
-                ),
-              ElevatedButton(
-                onPressed: () async {
-                  if (formKey.currentState?.validate() ?? false) {
-                    final newName = controller.text.trim();
-                    if (mounted) {
-                      setState(() {
-                        _currentUserName = newName;
-                      });
-                    }
-                    if (ctx.mounted) Navigator.of(ctx).pop();
-                    await DirectChatRepository.instance.registerOrUpdateUser(
-                      userId: _currentUserId,
-                      username: newName,
-                    );
-                    await _fetchContacts();
-                  }
-                },
-                child: const Text('Guardar'),
-              ),
-            ],
-          ),
-        );
-      },
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => ContactProfileSheet(
+        userId: contact.userId,
+        username: contact.username,
+        fullName: contact.fullName,
+        bio: contact.bio,
+        avatarUrl: contact.avatarUrl,
+      ),
     );
   }
 
@@ -312,9 +297,12 @@ class _ChatListScreenState extends State<ChatListScreen> {
   Future<void> _openChatWith({
     required String recipientUserId,
     required String recipientName,
+    String? recipientAvatarUrl,
+    String? recipientBio,
+    String recipientFullName = '',
   }) async {
     if (_currentUserName.isEmpty) {
-      await _promptForUserName(canCancel: false);
+      await _openMyProfileScreen(isFirstSetup: true);
       if (_currentUserName.isEmpty) return;
     }
 
@@ -326,6 +314,9 @@ class _ChatListScreenState extends State<ChatListScreen> {
           currentUserName: _currentUserName,
           recipientUserId: recipientUserId,
           recipientName: recipientName,
+          initialRecipientAvatarUrl: recipientAvatarUrl,
+          initialRecipientBio: recipientBio,
+          initialRecipientFullName: recipientFullName,
         ),
       ),
     );
@@ -349,20 +340,6 @@ class _ChatListScreenState extends State<ChatListScreen> {
     }
   }
 
-  Color _avatarColorFor(String idOrName) {
-    final palette = [
-      Colors.indigo,
-      Colors.teal,
-      Colors.deepPurple,
-      Colors.blue.shade700,
-      Colors.orange.shade800,
-      Colors.pink.shade700,
-      Colors.cyan.shade700,
-    ];
-    final hash = idOrName.toLowerCase().codeUnits.fold<int>(0, (p, c) => p + c);
-    return palette[hash % palette.length];
-  }
-
   @override
   Widget build(BuildContext context) {
     if (_isLoadingUser) {
@@ -375,38 +352,60 @@ class _ChatListScreenState extends State<ChatListScreen> {
       if (_searchQuery.isEmpty) return true;
       final q = _searchQuery.toLowerCase();
       return c.username.toLowerCase().contains(q) ||
+          c.fullName.toLowerCase().contains(q) ||
+          (c.bio?.toLowerCase().contains(q) ?? false) ||
           (c.lastMessage?.toLowerCase().contains(q) ?? false);
     }).toList();
 
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'FinChat 1:1',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            Row(
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: const BoxDecoration(
-                    color: Colors.greenAccent,
-                    shape: BoxShape.circle,
-                  ),
+        titleSpacing: 12,
+        title: GestureDetector(
+          onTap: () => _openMyProfileScreen(isFirstSetup: false),
+          child: Row(
+            children: [
+              UserAvatarWidget(
+                userId: _currentUserId,
+                username: _currentUserName.isNotEmpty ? _currentUserName : '?',
+                avatarUrl: _currentUserAvatarUrl,
+                radius: 19,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'FinChat 1:1',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: const BoxDecoration(
+                            color: Colors.greenAccent,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            _currentUserName.isNotEmpty
+                                ? 'Mi perfil: $_currentUserName'
+                                : 'Configurar perfil',
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 12, color: Colors.white70),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 6),
-                Text(
-                  _currentUserName.isNotEmpty
-                      ? 'Conectado como: $_currentUserName'
-                      : 'Sin usuario',
-                  style: const TextStyle(fontSize: 12, color: Colors.white70),
-                ),
-              ],
-            ),
-          ],
+              ),
+            ],
+          ),
         ),
         actions: [
           IconButton(
@@ -416,19 +415,31 @@ class _ChatListScreenState extends State<ChatListScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.manage_accounts_outlined),
-            tooltip: 'Cambiar mi nombre',
-            onPressed: () => _promptForUserName(canCancel: true),
+            tooltip: 'Editar mi perfil y avatar',
+            onPressed: () => _openMyProfileScreen(isFirstSetup: false),
           ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected: (value) {
-              if (value == 'showcase') {
+              if (value == 'profile') {
+                _openMyProfileScreen(isFirstSetup: false);
+              } else if (value == 'showcase') {
                 Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const ShowcaseHomeView()),
                 );
               }
             },
             itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'profile',
+                child: Row(
+                  children: [
+                    Icon(Icons.person_outline, size: 20, color: AppTheme.primaryColor),
+                    SizedBox(width: 8),
+                    Text('Mi Perfil y Avatar'),
+                  ],
+                ),
+              ),
               const PopupMenuItem(
                 value: 'showcase',
                 child: Row(
@@ -452,7 +463,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
               controller: _searchController,
               onChanged: (val) => setState(() => _searchQuery = val.trim()),
               decoration: InputDecoration(
-                hintText: 'Buscar usuario o conversación...',
+                hintText: 'Buscar usuario, estado o conversación...',
                 prefixIcon: const Icon(Icons.search),
                 suffixIcon: _searchQuery.isNotEmpty
                     ? IconButton(
@@ -510,7 +521,7 @@ class _ChatListScreenState extends State<ChatListScreen> {
                                       ),
                                       const SizedBox(height: 8),
                                       const Text(
-                                        'En cuanto otro dispositivo abra la aplicación, aparecerá aquí automáticamente con su ID único.',
+                                        'En cuanto otro dispositivo abra la aplicación, aparecerá aquí automáticamente con su avatar y perfil.',
                                         textAlign: TextAlign.center,
                                         style: TextStyle(fontSize: 13, color: Colors.grey),
                                       ),
@@ -524,45 +535,61 @@ class _ChatListScreenState extends State<ChatListScreen> {
                             physics: const AlwaysScrollableScrollPhysics(),
                             itemCount: filteredContacts.length,
                             separatorBuilder: (context, index) =>
-                                const Divider(height: 1, indent: 72),
+                                const Divider(height: 1, indent: 76),
                             itemBuilder: (context, index) {
                               final contact = filteredContacts[index];
                               final hasMessage = contact.lastMessage != null &&
                                   contact.lastMessage!.isNotEmpty;
-                              final initial = contact.username.isNotEmpty
-                                  ? contact.username[0].toUpperCase()
-                                  : '?';
+                              final fallbackSubtitle = (contact.bio != null &&
+                                      contact.bio!.trim().isNotEmpty)
+                                  ? contact.bio!.trim()
+                                  : 'Toca para iniciar conversación 1:1';
 
                               return ListTile(
                                 contentPadding: const EdgeInsets.symmetric(
                                   horizontal: 16,
                                   vertical: 6,
                                 ),
-                                leading: CircleAvatar(
-                                  radius: 24,
-                                  backgroundColor: _avatarColorFor(contact.userId),
-                                  child: Text(
-                                    initial,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 18,
-                                    ),
-                                  ),
+                                leading: UserAvatarWidget(
+                                  userId: contact.userId,
+                                  username: contact.username,
+                                  avatarUrl: contact.avatarUrl,
+                                  radius: 25,
+                                  onTap: () => _showContactProfileSheet(contact),
                                 ),
-                                title: Text(
-                                  contact.username,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                    fontSize: 16,
-                                  ),
+                                title: Row(
+                                  children: [
+                                    Flexible(
+                                      child: Text(
+                                        contact.username,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 16,
+                                        ),
+                                      ),
+                                    ),
+                                    if (contact.fullName.trim().isNotEmpty) ...[
+                                      const SizedBox(width: 6),
+                                      Flexible(
+                                        child: Text(
+                                          '(${contact.fullName.trim()})',
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: Colors.grey.shade600,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
                                 ),
                                 subtitle: Padding(
                                   padding: const EdgeInsets.only(top: 4),
                                   child: Text(
                                     hasMessage
                                         ? '${contact.isLastFromMe ? "Tú: " : ""}${contact.lastMessage}'
-                                        : 'Toca para iniciar conversación 1:1',
+                                        : fallbackSubtitle,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
@@ -597,6 +624,9 @@ class _ChatListScreenState extends State<ChatListScreen> {
                                 onTap: () => _openChatWith(
                                   recipientUserId: contact.userId,
                                   recipientName: contact.username,
+                                  recipientAvatarUrl: contact.avatarUrl,
+                                  recipientBio: contact.bio,
+                                  recipientFullName: contact.fullName,
                                 ),
                               );
                             },

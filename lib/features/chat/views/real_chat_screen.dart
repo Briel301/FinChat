@@ -1,22 +1,24 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/supabase/supabase_config.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../users/views/user_profile_screen.dart';
 import '../services/direct_chat_repository.dart';
 
 /// Pantalla de conversación privada 1:1 en tiempo real vinculada por ID único inmutable (`UUID`)
-/// con soporte para envío y visualización de imágenes desde galería y cámara.
+/// con soporte para envío y visualización de imágenes desde galería/cámara y perfil de contacto.
 class RealChatScreen extends StatefulWidget {
   final String currentUserId;
   final String currentUserName;
   final String recipientUserId;
   final String recipientName;
+  final String? initialRecipientAvatarUrl;
+  final String? initialRecipientBio;
+  final String initialRecipientFullName;
 
   const RealChatScreen({
     super.key,
@@ -24,6 +26,9 @@ class RealChatScreen extends StatefulWidget {
     required this.currentUserName,
     required this.recipientUserId,
     required this.recipientName,
+    this.initialRecipientAvatarUrl,
+    this.initialRecipientBio,
+    this.initialRecipientFullName = '',
   });
 
   @override
@@ -33,7 +38,6 @@ class RealChatScreen extends StatefulWidget {
 class _RealChatScreenState extends State<RealChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-  final ImagePicker _imagePicker = ImagePicker();
 
   List<Map<String, dynamic>> _messages = [];
   RealtimeChannel? _realtimeChannel;
@@ -42,6 +46,10 @@ class _RealChatScreenState extends State<RealChatScreen> {
   late String _currentUserId;
   late String _currentUserName;
   late String _recipientName;
+  String? _recipientAvatarUrl;
+  String? _recipientBio;
+  String _recipientFullName = '';
+
   bool _isLoadingMessages = true;
   bool _isSending = false;
   bool _isUploadingMedia = false;
@@ -52,6 +60,9 @@ class _RealChatScreenState extends State<RealChatScreen> {
     _currentUserId = widget.currentUserId;
     _currentUserName = widget.currentUserName;
     _recipientName = widget.recipientName;
+    _recipientAvatarUrl = widget.initialRecipientAvatarUrl;
+    _recipientBio = widget.initialRecipientBio;
+    _recipientFullName = widget.initialRecipientFullName;
     _initChat();
   }
 
@@ -64,6 +75,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   void _initChat() {
     _fetchMessages();
+    _refreshRecipientProfile();
     _subscribeToRealtime();
     _startBackgroundSync();
   }
@@ -88,19 +100,20 @@ class _RealChatScreenState extends State<RealChatScreen> {
   Future<void> _refreshRecipientProfile() async {
     if (widget.recipientUserId.isEmpty) return;
     try {
-      final data = await SupabaseConfig.client
-          .from(SupabaseConfig.tableProfiles)
-          .select('username')
-          .eq('id', widget.recipientUserId)
-          .maybeSingle();
+      final data = await DirectChatRepository.instance.fetchUserProfile(widget.recipientUserId);
 
       if (data != null && mounted) {
         final updatedName = (data['username'] ?? '').toString().trim();
-        if (updatedName.isNotEmpty && updatedName != _recipientName) {
-          setState(() {
-            _recipientName = updatedName;
-          });
-        }
+        final updatedAvatar = (data['avatar_url'] ?? '').toString().trim();
+        final updatedBio = (data['bio'] ?? '').toString().trim();
+        final updatedFullName = (data['full_name'] ?? '').toString().trim();
+
+        setState(() {
+          if (updatedName.isNotEmpty) _recipientName = updatedName;
+          _recipientAvatarUrl = updatedAvatar.isNotEmpty ? updatedAvatar : null;
+          _recipientBio = updatedBio.isNotEmpty ? updatedBio : null;
+          _recipientFullName = updatedFullName;
+        });
       }
     } catch (_) {}
   }
@@ -176,13 +189,17 @@ class _RealChatScreenState extends State<RealChatScreen> {
           table: SupabaseConfig.tableProfiles,
           callback: (payload) {
             final updated = payload.newRecord;
-            if (updated['id']?.toString() == widget.recipientUserId) {
+            if (updated['id']?.toString() == widget.recipientUserId && mounted) {
               final newName = (updated['username'] ?? '').toString().trim();
-              if (newName.isNotEmpty && mounted) {
-                setState(() {
-                  _recipientName = newName;
-                });
-              }
+              final newAvatar = (updated['avatar_url'] ?? '').toString().trim();
+              final newBio = (updated['bio'] ?? '').toString().trim();
+              final newFullName = (updated['full_name'] ?? '').toString().trim();
+              setState(() {
+                if (newName.isNotEmpty) _recipientName = newName;
+                _recipientAvatarUrl = newAvatar.isNotEmpty ? newAvatar : null;
+                _recipientBio = newBio.isNotEmpty ? newBio : null;
+                _recipientFullName = newFullName;
+              });
             }
           },
         )
@@ -215,6 +232,22 @@ class _RealChatScreenState extends State<RealChatScreen> {
         );
       }
     });
+  }
+
+  void _showRecipientProfile() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => ContactProfileSheet(
+        userId: widget.recipientUserId,
+        username: _recipientName,
+        fullName: _recipientFullName,
+        bio: _recipientBio,
+        avatarUrl: _recipientAvatarUrl,
+      ),
+    );
   }
 
   Future<void> _sendMessage() async {
@@ -255,40 +288,13 @@ class _RealChatScreenState extends State<RealChatScreen> {
     }
   }
 
-  /// Comprime los bytes de imagen en plataformas móviles (Android/iOS) con fallback seguro en Desktop.
-  Future<Uint8List> _compressImageBytes(Uint8List rawBytes) async {
-    if (!kIsWeb &&
-        (defaultTargetPlatform == TargetPlatform.android ||
-            defaultTargetPlatform == TargetPlatform.iOS)) {
-      try {
-        final compressed = await FlutterImageCompress.compressWithList(
-          rawBytes,
-          minWidth: 1280,
-          minHeight: 1280,
-          quality: 78,
-        );
-        if (compressed.isNotEmpty && compressed.length < rawBytes.length) {
-          return compressed;
-        }
-      } catch (e) {
-        debugPrint('[RealChatScreen] Compresión nativa omitida, usando bytes originales: $e');
-      }
-    }
-    return rawBytes;
-  }
-
   /// Permite seleccionar una imagen de la galería o tomar una foto con la cámara,
   /// previsualizarla, añadir un comentario opcional y enviarla a la conversación.
   Future<void> _pickAndSendImage(ImageSource source) async {
     if (_isUploadingMedia || _currentUserId.isEmpty) return;
 
     try {
-      final XFile? picked = await _imagePicker.pickImage(
-        source: source,
-        maxWidth: 1600,
-        maxHeight: 1600,
-        imageQuality: 85,
-      );
+      final XFile? picked = await DirectChatRepository.instance.pickOrCaptureImage(source);
 
       if (picked == null || !mounted) return;
 
@@ -371,7 +377,7 @@ class _RealChatScreenState extends State<RealChatScreen> {
         _isUploadingMedia = true;
       });
 
-      final optimizedBytes = await _compressImageBytes(rawBytes);
+      final optimizedBytes = await DirectChatRepository.instance.compressImageBytes(rawBytes);
       final ext = picked.name.contains('.') ? picked.name.split('.').last.toLowerCase() : 'jpg';
       final contentType = ext == 'png'
           ? 'image/png'
@@ -397,23 +403,12 @@ class _RealChatScreenState extends State<RealChatScreen> {
       );
 
       _addOrUpdateMessage(inserted);
-    } on UnsupportedError catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'La cámara directa no está disponible en este entorno de escritorio. Prueba en Android o usa la Galería.',
-            ),
-            backgroundColor: Colors.orange,
-          ),
-        );
-      }
     } catch (e) {
       debugPrint('[RealChatScreen] Error al subir/enviar imagen: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error al enviar imagen: $e'),
+            content: Text('Error al capturar/enviar imagen: $e'),
             backgroundColor: Colors.redAccent,
           ),
         );
@@ -596,52 +591,67 @@ class _RealChatScreenState extends State<RealChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final recipientInitial = _recipientName.isNotEmpty
-        ? _recipientName[0].toUpperCase()
-        : '?';
+    final subtitleBio = (_recipientBio != null && _recipientBio!.trim().isNotEmpty)
+        ? _recipientBio!.trim()
+        : 'Toca para ver info del contacto';
 
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 0,
-        title: Row(
-          children: [
-            CircleAvatar(
-              radius: 18,
-              backgroundColor: Colors.white24,
-              child: Text(
-                recipientInitial,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
+        title: InkWell(
+          onTap: _showRecipientProfile,
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+            child: Row(
+              children: [
+                UserAvatarWidget(
+                  userId: widget.recipientUserId,
+                  username: _recipientName,
+                  avatarUrl: _recipientAvatarUrl,
+                  radius: 19,
                 ),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    _recipientName,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-                  ),
-                  const Row(
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(Icons.verified_user_outlined, size: 11, color: Colors.greenAccent),
-                      SizedBox(width: 4),
                       Text(
-                        'Chat 1:1 vinculado por ID único',
-                        style: TextStyle(fontSize: 11, color: Colors.white70),
+                        _recipientName,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                      ),
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.info_outline,
+                            size: 11,
+                            color: Colors.greenAccent,
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              subtitleBio,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 11, color: Colors.white70),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.person_outline),
+            tooltip: 'Ver perfil del contacto',
+            onPressed: _showRecipientProfile,
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'Sincronizar mensajes',
@@ -671,10 +681,12 @@ class _RealChatScreenState extends State<RealChatScreen> {
                                   padding: const EdgeInsets.symmetric(horizontal: 24),
                                   child: Column(
                                     children: [
-                                      Icon(
-                                        Icons.mark_chat_unread_outlined,
-                                        size: 64,
-                                        color: Colors.grey.shade400,
+                                      UserAvatarWidget(
+                                        userId: widget.recipientUserId,
+                                        username: _recipientName,
+                                        avatarUrl: _recipientAvatarUrl,
+                                        radius: 40,
+                                        onTap: _showRecipientProfile,
                                       ),
                                       const SizedBox(height: 12),
                                       Text(
